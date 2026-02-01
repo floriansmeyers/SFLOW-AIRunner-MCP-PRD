@@ -1,0 +1,38 @@
+{
+  "description": "Upload images to Cloudflare R2 for public hosting. Useful for Instagram API which requires publicly accessible image URLs.",
+  "created_at": "2026-01-14T22:42:20.619096+00:00",
+  "updated_at": "2026-01-14T23:04:53.448178+00:00",
+  "enabled": true,
+  "env_vars": [
+    {
+      "name": "R2_ENDPOINT",
+      "description": "R2 S3-compatible endpoint URL",
+      "required": true,
+      "sensitive": false
+    },
+    {
+      "name": "R2_ACCESS_KEY_ID",
+      "description": "R2 API access key ID",
+      "required": true,
+      "sensitive": false
+    },
+    {
+      "name": "R2_SECRET_ACCESS_KEY",
+      "description": "R2 API secret access key",
+      "required": true,
+      "sensitive": true
+    },
+    {
+      "name": "R2_BUCKET_NAME",
+      "description": "R2 bucket name",
+      "required": true,
+      "sensitive": false
+    },
+    {
+      "name": "R2_PUBLIC_DOMAIN",
+      "description": "Public domain for the bucket (without https://)",
+      "required": true,
+      "sensitive": false
+    }
+  ]
+}

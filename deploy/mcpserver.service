@@ -1,0 +1,23 @@
+[Unit]
+Description=MCP Server with Job Scheduling
+After=network.target
+
+[Service]
+Type=simple
+User=mcpuser
+WorkingDirectory=/opt/mcpserver/app
+Environment=PATH=/opt/mcpserver/app/venv/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=/opt/mcpserver/app/.env
+ExecStart=/opt/mcpserver/app/venv/bin/python server.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/opt/mcpserver/app
+
+[Install]
+WantedBy=multi-user.target

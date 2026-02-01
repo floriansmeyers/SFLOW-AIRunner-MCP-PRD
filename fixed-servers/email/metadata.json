@@ -1,0 +1,44 @@
+{
+  "description": "Email sending via SendGrid or Mailgun",
+  "built_in": true,
+  "created_at": "2026-01-10T00:00:00+00:00",
+  "enabled": true,
+  "env_vars": [
+    {
+      "name": "EMAIL_PROVIDER",
+      "description": "Email provider: 'sendgrid' or 'mailgun'",
+      "required": true,
+      "sensitive": false
+    },
+    {
+      "name": "SENDGRID_API_KEY",
+      "description": "SendGrid API key (required if provider is sendgrid)",
+      "required": false,
+      "sensitive": true
+    },
+    {
+      "name": "MAILGUN_API_KEY",
+      "description": "Mailgun API key (required if provider is mailgun)",
+      "required": false,
+      "sensitive": true
+    },
+    {
+      "name": "MAILGUN_DOMAIN",
+      "description": "Mailgun domain (required if provider is mailgun, e.g., 'mg.yourdomain.com')",
+      "required": false,
+      "sensitive": false
+    },
+    {
+      "name": "EMAIL_FROM_ADDRESS",
+      "description": "Sender email address (must be verified with provider)",
+      "required": true,
+      "sensitive": false
+    },
+    {
+      "name": "EMAIL_FROM_NAME",
+      "description": "Display name for the sender (optional)",
+      "required": false,
+      "sensitive": false
+    }
+  ]
+}

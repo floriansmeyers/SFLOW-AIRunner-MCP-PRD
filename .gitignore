@@ -1,0 +1,24 @@
+# Secrets and local data
+.env
+jobs.db
+
+# Runtime artifacts
+tmp/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Build
+dist/
+build/
+venv/
+.venv/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local Claude settings
+.claude/settings.local.json

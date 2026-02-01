@@ -1,0 +1,6 @@
+[Unit]
+Description=Auto-deploy MCP Server from GitHub
+
+[Service]
+Type=oneshot
+ExecStart=/opt/mcpserver/deploy.sh
