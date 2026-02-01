@@ -14,8 +14,8 @@ A single-file MCP server that schedules and executes Claude Code CLI tasks via c
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-repo/SFLOW-AIagents-MCP-Spinner.git
-cd SFLOW-AIagents-MCP-Spinner
+git clone https://github.com/floriansmeyers/SFLOW-AIRunner-MCP-PRD.git
+cd SFLOW-AIRunner-MCP-PRD
 
 # Create and activate virtual environment
 python3 -m venv .venv
@@ -136,7 +136,7 @@ Then restart the server to generate new credentials.
 ## Directory Structure
 
 ```
-SFLOW-AIagents-MCP-Spinner/
+SFLOW-AIRunner-MCP-PRD/
 ├── server.py              # Main MCP server
 ├── requirements.txt       # Python dependencies
 ├── jobs.db               # SQLite database (auto-created)
@@ -260,7 +260,36 @@ python server.py  # Creates fresh database
 | `get_unconfigured_servers` | Find servers missing credentials |
 | `delete_server_credential(server, key)` | Delete a credential |
 
-## Example Usage (via Claude)
+## Usage via claude.ai
+
+Once connected, you interact with the server entirely through natural language. Claude translates your requests into the appropriate MCP tool calls behind the scenes.
+
+**Important:** Jobs are executed via the Claude Agent SDK, which runs the local Claude Code CLI under the hood. You need [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude` must be available on the system PATH and logged in) on the machine running the server.
+
+Below are the main workflows.
+
+### Creating Custom Tools
+
+You can ask Claude to build new MCP tool servers on the fly. The server code is saved to `dynamic_servers/<name>/` and each server gets a `DATA_DIR` path variable for local file storage. Environment variables referenced via `os.environ.get()` or `os.getenv()` in the code are auto-detected and marked as required credentials.
+
+```
+You: Create a tool that fetches the current weather for a given city using the
+     OpenWeatherMap API.
+
+Claude: [calls create_mcp_server — saves server to dynamic_servers/weather/,
+         detects OPENWEATHERMAP_API_KEY from code]
+  Done! I created the "weather" server with a get_weather(city) tool.
+  It needs an API key — want me to store yours now?
+
+You: Yes, the key is abc123
+
+Claude: [calls set_server_credential("weather", "OPENWEATHERMAP_API_KEY", "abc123")]
+  Credential saved. The weather server is ready to use.
+```
+
+### Scheduling Recurring Jobs
+
+Jobs run on cron schedules using the Claude Agent SDK. You can specify which tools the job is allowed to use (empty array `[]` means all tools).
 
 ```
 You: Create a job that runs every weekday at 9am to summarize our Azure DevOps sprint
@@ -268,11 +297,84 @@ You: Create a job that runs every weekday at 9am to summarize our Azure DevOps s
 Claude: [calls create_job with:]
   name: "Daily Sprint Summary"
   cron: "0 9 * * 1-5"
-  prompt: "Connect to Azure DevOps and summarize the current sprint status..."
+  prompt: "Connect to Azure DevOps and summarize the current sprint..."
+  tools: ["mcp__azure-devops__wit_my_work_items", "mcp__email__send_email"]
+  Job created (id: a1b2c3d4). Next run: tomorrow at 9:00 AM.
 
 You: Show me the last 5 runs
 
 Claude: [calls list_runs with limit=5]
+  Here are the recent runs — 4 completed successfully, 1 errored out...
+```
+
+### Setting Up Webhooks
+
+Webhooks let external services trigger a prompt via HTTP POST. The `prompt_template` supports `{{payload}}` for the full body or `{{payload.field.subfield}}` for nested values.
+
+```
+You: Create a webhook that sends a Slack summary whenever a new Azure DevOps
+     work item is created. The POST body will have the item title at
+     resource.fields.System.Title.
+
+Claude: [calls create_webhook with:]
+  name: "New Work Item Notifier"
+  prompt_template: "A new work item was created: {{payload.resource.fields.System.Title}}.
+                    Summarize it and post to Slack."
+  Webhook created! POST to this URL to trigger it:
+  https://your-server.com/webhook/abc123def456...
+
+You: Test it — trigger the webhook manually
+
+Claude: I can't trigger webhooks via MCP, but you can test with curl:
+  curl -X POST https://your-server.com/webhook/abc123def456... \
+    -H "Content-Type: application/json" \
+    -d '{"resource":{"fields":{"System":{"Title":"Bug: login broken"}}}}'
+```
+
+### Invoking Tools Directly
+
+Use `invoke_internal_mcp_tool` to call a tool on any enabled MCP server immediately, without creating a job.
+
+```
+You: Use the weather tool to check the forecast in Berlin
+
+Claude: [calls invoke_internal_mcp_tool with:]
+  tool: "mcp__weather__get_weather"
+  payload: {"city": "Berlin"}
+  Currently 12°C and cloudy in Berlin, with rain expected this afternoon.
+```
+
+### Managing Servers & Credentials
+
+You can enable, disable, and update both built-in (fixed) and user-created (dynamic) servers, and manage their credentials.
+
+```
+You: What servers are available?
+
+Claude: [calls list_fixed_mcp_servers and list_dynamic_mcp_servers]
+  Fixed servers: email (enabled), playwright (disabled)
+  Dynamic servers: weather (enabled), url-shortener (disabled)
+
+You: Enable playwright and disable the weather server
+
+Claude: [calls enable_fixed_server("playwright") and disable_mcp_server("weather")]
+  Done — playwright is now enabled and weather is disabled.
+
+You: Which servers are missing credentials?
+
+Claude: [calls get_unconfigured_servers]
+  The email server needs SENDGRID_API_KEY and SENDER_EMAIL.
+```
+
+### Ad-hoc Prompts
+
+For one-off tasks, use the **Quick Run** feature in the web dashboard (SSE mode) to execute a prompt immediately without creating a job. From claude.ai, you can also manually trigger any existing job:
+
+```
+You: Run the "Daily Sprint Summary" job right now
+
+Claude: [calls trigger_job("a1b2c3d4")]
+  Run queued (run_id: e5f6g7h8). I'll check back for results.
 ```
 
 ## Cron Examples
