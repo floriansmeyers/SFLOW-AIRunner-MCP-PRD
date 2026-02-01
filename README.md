@@ -2,6 +2,8 @@
 
 A single-file MCP server that schedules and executes Claude Code CLI tasks via cron expressions. Features a web dashboard, webhook support, dynamic MCP server creation, and token/cost tracking.
 
+![Dashboard](docs/dashboard.png)
+
 ## Prerequisites
 
 - **Python 3.11+** (required for `asyncio.timeout()`)
@@ -73,13 +75,14 @@ MCP_TRANSPORT=both python server.py
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `MCP_TRANSPORT` | No | `stdio` | Transport mode: `stdio`, `sse`, or `both` |
+| `MCP_TRANSPORT` | No | `both` | Transport mode: `stdio`, `sse`, or `both` |
 | `OAUTH_CLIENT_ID` | No | auto-generated | OAuth client ID |
 | `OAUTH_CLIENT_SECRET` | No | auto-generated | OAuth client secret |
 | `OAUTH_SECRET_KEY` | No | auto-generated | Secret key for signing JWT tokens |
 | `DASHBOARD_USERNAME` | No | - | Basic auth username for dashboard |
 | `DASHBOARD_PASSWORD` | No | - | Basic auth password for dashboard |
 | `NGROK_AUTHTOKEN` | No | - | ngrok auth token for remote tunneling |
+| `PUBLIC_URL` | No | - | Override base URL for OAuth callbacks (e.g., `https://your-domain.com`) |
 
 Create a `.env` file to persist these:
 
@@ -143,6 +146,13 @@ SFLOW-AIagents-MCP-Spinner/
 │       ├── server.py
 │       └── metadata.json
 ├── dynamic_servers/      # User-created MCP servers (auto-created)
+│   ├── cat-facts/
+│   └── r2-images/
+├── deploy/               # Deployment configs (systemd, nginx, deploy script)
+│   ├── deploy.sh
+│   ├── mcpserver.service
+│   ├── nginx.conf
+│   └── README-HETZNER.md
 └── claude_playground/    # Working directory for job execution (auto-created)
 ```
 
@@ -202,7 +212,7 @@ python server.py  # Creates fresh database
 |------|-------------|
 | `list_runs(job_id?, limit?)` | List recent runs |
 | `get_run(run_id)` | Get full run details including output |
-| `cancel_run(run_id)` | Cancel a pending/running run |
+| `kill_run(run_id)` | Cancel a pending/running run |
 
 ### Webhooks
 
@@ -221,8 +231,10 @@ python server.py  # Creates fresh database
 | `create_mcp_server(name, code, ...)` | Create a custom MCP server |
 | `list_dynamic_mcp_servers` | List user-created servers |
 | `get_dynamic_mcp_server(name)` | Get server details |
-| `update_dynamic_mcp_server(name, ...)` | Update a server |
-| `delete_dynamic_mcp_server(name)` | Delete a server |
+| `update_mcp_server(name, code, ...)` | Update a dynamic server's code/description |
+| `delete_mcp_server(name)` | Delete a dynamic server |
+| `enable_mcp_server(name)` | Enable a dynamic MCP server |
+| `disable_mcp_server(name)` | Disable a dynamic MCP server |
 
 ### Fixed MCP Servers
 
@@ -231,6 +243,12 @@ python server.py  # Creates fresh database
 | `list_fixed_mcp_servers` | List built-in servers |
 | `enable_fixed_server(name)` | Enable a fixed server |
 | `disable_fixed_server(name)` | Disable a fixed server |
+
+### Internal MCP Tools
+
+| Tool | Description |
+|------|-------------|
+| `invoke_internal_mcp_tool(tool, payload)` | Invoke a tool on an internal MCP server |
 
 ### Credentials
 
@@ -241,13 +259,6 @@ python server.py  # Creates fresh database
 | `list_required_credentials(server)` | See required credentials |
 | `get_unconfigured_servers` | Find servers missing credentials |
 | `delete_server_credential(server, key)` | Delete a credential |
-
-### Settings
-
-| Tool | Description |
-|------|-------------|
-| `get_settings` | Get current settings |
-| `update_settings(...)` | Update settings |
 
 ## Example Usage (via Claude)
 
@@ -385,3 +396,17 @@ The server runs three concurrent async components:
 1. **MCP Server** - Exposes 25+ tools via FastMCP
 2. **Scheduler Loop** - Checks every 60 seconds for jobs due based on cron
 3. **Run Processor Loop** - Picks up pending runs and executes them
+
+## Key Dependencies
+
+- `fastmcp` - MCP protocol implementation
+- `claude-agent-sdk` - Core execution engine for running jobs
+- `croniter` - Cron expression parsing
+- `sendgrid`, `requests` - Email provider integrations
+- `uvicorn` - ASGI server for SSE transport
+- `pyngrok` - ngrok tunnel for remote access from claude.ai
+- `python-dotenv` - `.env` file loading
+- `PyJWT` - JWT token handling for OAuth
+- `beautifulsoup4` - Web scraping
+- `boto3` - AWS integration
+- `playwright` - Browser automation

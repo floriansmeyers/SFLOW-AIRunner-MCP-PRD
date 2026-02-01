@@ -32,7 +32,7 @@ The server runs three concurrent async components in separate threads:
 2. **Scheduler Loop** - Checks every 60 seconds for jobs due based on cron expressions
 3. **Run Processor Loop** - Picks up pending runs and executes them (handles restarts gracefully)
 
-Jobs execute by spawning `claude -p <prompt> --output-format json` as a subprocess. Token usage and costs are parsed from CLI output.
+Jobs execute via `claude_agent_sdk` using the `sdk_query()` streaming API. Token usage and costs are parsed from the SDK response.
 
 ## Directory Structure
 
@@ -43,9 +43,10 @@ Jobs execute by spawning `claude -p <prompt> --output-format json` as a subproce
 │   └── email/
 │       ├── server.py
 │       └── metadata.json
-└── dynamic_servers/    # User-created MCP servers via create_mcp_server tool
-    ├── facebook-nieuwsbalen/
-    └── azure-devops-workitems/
+├── dynamic_servers/    # User-created MCP servers via create_mcp_server tool
+│   ├── cat-facts/
+│   └── r2-images/
+└── deploy/             # Deployment configs (systemd, nginx, deploy script)
 ```
 
 ## Database
@@ -60,17 +61,17 @@ SQLite at `./jobs.db` with tables:
 
 **Job Management:** `list_jobs`, `get_job`, `create_job`, `update_job`, `delete_job`, `trigger_job`
 
-**Run Management:** `list_runs`, `get_run`, `cancel_run`
+**Run Management:** `list_runs`, `get_run`, `kill_run`
 
 **Webhooks:** `create_webhook`, `list_webhooks`, `get_webhook`, `update_webhook`, `delete_webhook`
 
-**Dynamic MCP Servers:** `create_mcp_server`, `list_dynamic_mcp_servers`, `get_dynamic_mcp_server`, `update_dynamic_mcp_server`, `delete_dynamic_mcp_server`
+**Dynamic MCP Servers:** `create_mcp_server`, `list_dynamic_mcp_servers`, `get_dynamic_mcp_server`, `update_mcp_server`, `delete_mcp_server`, `enable_mcp_server`, `disable_mcp_server`
 
 **Fixed MCP Servers:** `list_fixed_mcp_servers`, `enable_fixed_server`, `disable_fixed_server`
 
 **Credential Management:** `set_server_credential`, `get_server_credentials`, `list_required_credentials`, `get_unconfigured_servers`, `delete_server_credential`
 
-**Settings:** `get_settings`, `update_settings`
+**Internal MCP:** `invoke_internal_mcp_tool`
 
 ## Credential Management
 
@@ -105,7 +106,13 @@ When creating dynamic servers with `create_mcp_server`, env vars can be auto-det
 ## Key Dependencies
 
 - `fastmcp` - MCP protocol implementation
+- `claude-agent-sdk` - Core execution engine for running jobs
 - `croniter` - Cron expression parsing
 - `sendgrid`, `requests` - Email provider integrations
 - `uvicorn` - ASGI server for SSE transport
 - `pyngrok` - ngrok tunnel for remote access from claude.ai
+- `python-dotenv` - `.env` file loading
+- `PyJWT` - JWT token handling for OAuth
+- `beautifulsoup4` - Web scraping
+- `boto3` - AWS integration
+- `playwright` - Browser automation
