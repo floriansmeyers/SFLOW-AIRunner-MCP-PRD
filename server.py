@@ -1011,6 +1011,24 @@ def get_server_url() -> str:
         return NGROK_PUBLIC_URL
     return "http://localhost:8080"
 
+def get_webhook_base_url() -> str:
+    """Get base URL for webhook endpoints (PUBLIC_URL > ngrok > DB setting > localhost)."""
+    public_url = os.environ.get("PUBLIC_URL")
+    if public_url:
+        return public_url.rstrip("/")
+    if NGROK_PUBLIC_URL:
+        return NGROK_PUBLIC_URL
+    # Fall back to DB setting
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
+        conn.close()
+        if row:
+            return json.loads(row['value'])
+    except:
+        pass
+    return "http://localhost:8080"
+
 def ensure_oauth_client() -> tuple[str, str]:
     """Ensure the OAuth client exists. Returns (client_id, client_secret).
 
@@ -2915,17 +2933,9 @@ async def api_webhooks_handler(request):
     """List all webhooks for dashboard"""
     conn = get_db()
     webhooks = conn.execute("SELECT * FROM webhooks ORDER BY created_at DESC").fetchall()
-
-    # Get base URL
-    base_url = "http://localhost:8080"
-    row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
-    if row:
-        try:
-            base_url = json.loads(row['value'])
-        except:
-            pass
     conn.close()
 
+    base_url = get_webhook_base_url()
     result = []
     for w in webhooks:
         webhook_dict = dict(w)
@@ -3794,16 +3804,9 @@ def create_webhook(name: str, prompt_template: str, description: str = "") -> st
     """, (webhook_id, name, description, secret_token, prompt_template, now, now))
     conn.commit()
 
-    # Get base URL from settings
-    base_url = "http://localhost:8080"
-    row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
-    if row:
-        try:
-            base_url = json.loads(row['value'])
-        except:
-            pass
     conn.close()
 
+    base_url = get_webhook_base_url()
     webhook_url = f"{base_url}/webhook/{secret_token}"
 
     return json.dumps({
@@ -3819,17 +3822,9 @@ def list_webhooks() -> str:
     """List all webhook endpoints"""
     conn = get_db()
     webhooks = conn.execute("SELECT * FROM webhooks ORDER BY created_at DESC").fetchall()
-
-    # Get base URL for display
-    base_url = "http://localhost:8080"
-    row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
-    if row:
-        try:
-            base_url = json.loads(row['value'])
-        except:
-            pass
     conn.close()
 
+    base_url = get_webhook_base_url()
     result = []
     for w in webhooks:
         webhook_dict = dict(w)
@@ -3847,16 +3842,9 @@ def get_webhook(webhook_id: str) -> str:
         conn.close()
         return json.dumps({"error": "Webhook not found"})
 
-    # Get base URL
-    base_url = "http://localhost:8080"
-    row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
-    if row:
-        try:
-            base_url = json.loads(row['value'])
-        except:
-            pass
     conn.close()
 
+    base_url = get_webhook_base_url()
     result = dict(webhook)
     result['url'] = f"{base_url}/webhook/{webhook['secret_token']}"
     return json.dumps(result, indent=2)

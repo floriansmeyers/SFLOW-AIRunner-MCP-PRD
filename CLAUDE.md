@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Rules
+
+- **Always update CLAUDE.md** when making changes that affect architecture, conventions, URL resolution logic, helper functions, or any other information documented here. Keep this file in sync with the codebase.
+
 ## Overview
 
 Single-file MCP server that schedules and executes Claude Code CLI tasks via cron expressions. Built with FastMCP and stores jobs/runs in SQLite. Features a web dashboard, webhook support, dynamic MCP server creation, and token/cost tracking.
@@ -72,6 +76,21 @@ SQLite at `./jobs.db` with tables:
 **Credential Management:** `set_server_credential`, `get_server_credentials`, `list_required_credentials`, `get_unconfigured_servers`, `delete_server_credential`
 
 **Internal MCP:** `invoke_internal_mcp_tool`
+
+## URL Resolution
+
+Two helpers in `server.py` resolve the public-facing server URL. Both follow the same priority order:
+
+1. `PUBLIC_URL` env var (highest priority)
+2. `NGROK_PUBLIC_URL` global (set when an ngrok tunnel is active)
+3. Fallback
+
+| Helper | Fallback | Used by |
+|--------|----------|---------|
+| `get_server_url()` | `http://localhost:8080` | OAuth, general server links |
+| `get_webhook_base_url()` | DB setting `webhook_base_url`, then `http://localhost:8080` | All webhook URL generation (`create_webhook`, `list_webhooks`, `get_webhook`, `api_webhooks_handler`) |
+
+When adding new code that builds user-facing URLs, use one of these helpers instead of hardcoding `localhost` or reading from the DB directly.
 
 ## Credential Management
 
