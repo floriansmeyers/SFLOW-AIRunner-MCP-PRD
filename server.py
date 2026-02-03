@@ -97,9 +97,12 @@ OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
 # Pricing per 1M tokens (as of 2024/2025)
 PRICING = {
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "claude-sonnet-4-5-20250514": {"input": 3.00, "output": 15.00},
     "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
     "claude-3-opus-20240229": {"input": 15.00, "output": 75.00},
+    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00},
     "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25},
+    "claude-haiku-4-5-20250514": {"input": 1.00, "output": 5.00},
     "default": {"input": 3.00, "output": 15.00}  # Fallback to Sonnet pricing
 }
 
@@ -434,6 +437,15 @@ def init_db():
     except: pass
     try:
         conn.execute("ALTER TABLE runs ADD COLUMN webhook_id TEXT")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE runs ADD COLUMN cache_read_tokens INTEGER DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE runs ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE runs ADD COLUMN web_search_requests INTEGER DEFAULT 0")
     except: pass
     conn.commit()
     return conn
@@ -1579,8 +1591,22 @@ DASHBOARD_HTML = """
             const model = run.model || '-';
             const inputTokens = run.input_tokens || 0;
             const outputTokens = run.output_tokens || 0;
+            const cacheReadTokens = run.cache_read_tokens || 0;
+            const cacheCreationTokens = run.cache_creation_tokens || 0;
+            const webSearchRequests = run.web_search_requests || 0;
 
-            document.getElementById('modal-title').innerHTML = (job ? escapeHtml(job.name) : 'Run ' + run.id) + ' ' + liveIndicator;
+            const modalTitle = document.getElementById('modal-title');
+            modalTitle.textContent = '';
+            modalTitle.appendChild(document.createTextNode((job ? job.name : 'Run ' + run.id) + ' '));
+            if (isLive) {
+                const liveBadge = document.createElement('span');
+                liveBadge.className = 'live-badge';
+                const liveDot = document.createElement('span');
+                liveDot.className = 'live-dot';
+                liveBadge.appendChild(liveDot);
+                liveBadge.appendChild(document.createTextNode('LIVE'));
+                modalTitle.appendChild(liveBadge);
+            }
             document.getElementById('modal-body').innerHTML = `
                 <div class="modal-section">
                     <div class="meta-grid">
@@ -1611,6 +1637,14 @@ DASHBOARD_HTML = """
                         <div class="meta-item">
                             <label>Tokens</label>
                             <span>${tokens > 0 ? tokens.toLocaleString() : '-'} ${tokens > 0 ? '(' + inputTokens.toLocaleString() + ' in / ' + outputTokens.toLocaleString() + ' out)' : ''}</span>
+                        </div>
+                        <div class="meta-item">
+                            <label>Cache Tokens</label>
+                            <span>${(cacheReadTokens > 0 || cacheCreationTokens > 0) ? cacheReadTokens.toLocaleString() + ' read / ' + cacheCreationTokens.toLocaleString() + ' created' : '-'}</span>
+                        </div>
+                        <div class="meta-item">
+                            <label>Web Searches</label>
+                            <span>${webSearchRequests > 0 ? webSearchRequests.toLocaleString() : '-'}</span>
                         </div>
                         <div class="meta-item">
                             <label>Cost</label>
@@ -4511,8 +4545,12 @@ You are restricted to working only within the claude_playground directory.
             "output_tokens": 0,
             "total_tokens": 0,
             "cost_usd": 0.0,
-            "model": None
+            "model": None,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "web_search_requests": 0,
         }
+        processed_ids = set()  # Deduplicate messages (parallel tool uses share IDs)
         final_result = None
 
         print(f"[execute_run] Starting SDK query for run {run_id} (v2 - JSON output)", file=sys.stderr)
@@ -4550,22 +4588,50 @@ You are restricted to working only within the claude_playground directory.
                             for block in nested_content:
                                 output_parts.append(serialize_content_block(block))
 
-                    # Capture token usage from system messages
+                    # Capture token usage from system messages (deduplicate by message ID)
+                    msg_id = getattr(message, 'id', None)
                     if hasattr(message, 'usage') and message.usage:
-                        u = message.usage
-                        if hasattr(u, 'input_tokens'):
-                            usage["input_tokens"] = u.input_tokens
-                        elif isinstance(u, dict):
-                            usage["input_tokens"] = u.get("input_tokens", usage["input_tokens"])
+                        if msg_id is None or msg_id not in processed_ids:
+                            if msg_id is not None:
+                                processed_ids.add(msg_id)
+                            u = message.usage
+                            if hasattr(u, 'input_tokens'):
+                                usage["input_tokens"] = u.input_tokens
+                            elif isinstance(u, dict):
+                                usage["input_tokens"] = u.get("input_tokens", usage["input_tokens"])
 
-                        if hasattr(u, 'output_tokens'):
-                            usage["output_tokens"] = u.output_tokens
-                        elif isinstance(u, dict):
-                            usage["output_tokens"] = u.get("output_tokens", usage["output_tokens"])
+                            if hasattr(u, 'output_tokens'):
+                                usage["output_tokens"] = u.output_tokens
+                            elif isinstance(u, dict):
+                                usage["output_tokens"] = u.get("output_tokens", usage["output_tokens"])
+
+                            # Capture cache token usage
+                            cache_read = getattr(u, 'cache_read_input_tokens', None) or (u.get('cache_read_input_tokens') if isinstance(u, dict) else None)
+                            if cache_read:
+                                usage["cache_read_tokens"] = cache_read
+                            cache_creation = getattr(u, 'cache_creation_input_tokens', None) or (u.get('cache_creation_input_tokens') if isinstance(u, dict) else None)
+                            if cache_creation:
+                                usage["cache_creation_tokens"] = cache_creation
 
                     # Capture model info
                     if hasattr(message, 'model') and message.model:
                         usage["model"] = message.model
+
+                    # Capture authoritative cost from SDK ResultMessage
+                    if hasattr(message, 'total_cost_usd') and message.total_cost_usd:
+                        usage["cost_usd"] = message.total_cost_usd
+                    if hasattr(message, 'model_usage') and message.model_usage:
+                        # model_usage may contain per-model breakdown; extract web search count if available
+                        mu = message.model_usage
+                        if isinstance(mu, dict):
+                            for model_info in mu.values():
+                                if isinstance(model_info, dict):
+                                    usage["web_search_requests"] += model_info.get('web_search_requests', 0)
+                        elif hasattr(mu, '__iter__'):
+                            for model_info in mu:
+                                ws = getattr(model_info, 'web_search_requests', 0)
+                                if ws:
+                                    usage["web_search_requests"] += ws
 
                     # Capture final result
                     if hasattr(message, 'result') and message.result:
@@ -4602,8 +4668,8 @@ You are restricted to working only within the claude_playground directory.
         # Calculate total tokens
         usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
 
-        # Calculate cost using pricing table
-        if usage["input_tokens"] > 0 or usage["output_tokens"] > 0:
+        # Only calculate cost manually if SDK didn't provide authoritative total_cost_usd
+        if usage["cost_usd"] == 0.0 and (usage["input_tokens"] > 0 or usage["output_tokens"] > 0):
             model = usage["model"] or "default"
             pricing = PRICING.get(model, PRICING["default"])
             input_cost = (usage["input_tokens"] / 1_000_000) * pricing["input"]
@@ -4622,11 +4688,16 @@ You are restricted to working only within the claude_playground directory.
                 output_tokens = ?,
                 total_tokens = ?,
                 cost_usd = ?,
-                model = ?
+                model = ?,
+                cache_read_tokens = ?,
+                cache_creation_tokens = ?,
+                web_search_requests = ?
             WHERE id = ?
         """, (now, output, 0, "finished",
               usage["input_tokens"], usage["output_tokens"], usage["total_tokens"],
-              usage["cost_usd"], usage["model"], run_id))
+              usage["cost_usd"], usage["model"],
+              usage["cache_read_tokens"], usage["cache_creation_tokens"],
+              usage["web_search_requests"], run_id))
 
         # Update job's last_executed_at
         conn.execute("""
