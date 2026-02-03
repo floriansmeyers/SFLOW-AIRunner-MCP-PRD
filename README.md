@@ -9,6 +9,10 @@ A single-file MCP server that schedules and executes Claude Code CLI tasks via c
 - **Python 3.11+** (required for `asyncio.timeout()`)
 - **Claude Agent SDK** (`pip install claude-agent-sdk`)
 - **SQLite3** (usually pre-installed on macOS/Linux)
+- **Anthropic API key** - Jobs are executed via the Claude Agent SDK, which requires an `ANTHROPIC_API_KEY`. **Do not rely on a personal Max/Pro subscription** — the SDK needs an API key from [console.anthropic.com](https://console.anthropic.com/). Set it in your environment or `.env` file:
+  ```bash
+  export ANTHROPIC_API_KEY=sk-ant-...
+  ```
 
 ## Quick Start
 
@@ -75,6 +79,7 @@ MCP_TRANSPORT=both python server.py
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
+| `ANTHROPIC_API_KEY` | **Yes** | - | API key from [console.anthropic.com](https://console.anthropic.com/) — required for job execution via the Claude Agent SDK. Do not use a personal Max/Pro subscription. |
 | `MCP_TRANSPORT` | No | `both` | Transport mode: `stdio`, `sse`, or `both` |
 | `OAUTH_CLIENT_ID` | No | auto-generated | OAuth client ID |
 | `OAUTH_CLIENT_SECRET` | No | auto-generated | OAuth client secret |
@@ -87,6 +92,7 @@ MCP_TRANSPORT=both python server.py
 Create a `.env` file to persist these:
 
 ```env
+ANTHROPIC_API_KEY=sk-ant-...
 OAUTH_CLIENT_ID=your_client_id
 OAUTH_CLIENT_SECRET=your_client_secret
 OAUTH_SECRET_KEY=your_secret_key

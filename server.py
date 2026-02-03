@@ -97,9 +97,12 @@ OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
 # Pricing per 1M tokens (as of 2024/2025)
 PRICING = {
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "claude-sonnet-4-5-20250514": {"input": 3.00, "output": 15.00},
     "claude-3-5-sonnet-20241022": {"input": 3.00, "output": 15.00},
     "claude-3-opus-20240229": {"input": 15.00, "output": 75.00},
+    "claude-opus-4-5-20251101": {"input": 5.00, "output": 25.00},
     "claude-3-haiku-20240307": {"input": 0.25, "output": 1.25},
+    "claude-haiku-4-5-20250514": {"input": 1.00, "output": 5.00},
     "default": {"input": 3.00, "output": 15.00}  # Fallback to Sonnet pricing
 }
 
@@ -369,6 +372,19 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_webhooks_token ON webhooks(secret_token);
 
+        CREATE TABLE IF NOT EXISTS tool_logs (
+            id TEXT PRIMARY KEY,
+            server_name TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            payload TEXT,
+            result TEXT,
+            error TEXT,
+            status TEXT DEFAULT 'success',
+            duration_ms REAL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tool_logs_created ON tool_logs(created_at);
+
         -- OAuth 2.1 tables for MCP authentication
         CREATE TABLE IF NOT EXISTS oauth_clients (
             client_id TEXT PRIMARY KEY,
@@ -434,6 +450,15 @@ def init_db():
     except: pass
     try:
         conn.execute("ALTER TABLE runs ADD COLUMN webhook_id TEXT")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE runs ADD COLUMN cache_read_tokens INTEGER DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE runs ADD COLUMN cache_creation_tokens INTEGER DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE runs ADD COLUMN web_search_requests INTEGER DEFAULT 0")
     except: pass
     conn.commit()
     return conn
@@ -865,7 +890,17 @@ def _load_mcp_tool_from_file(server_name: str, server_path: Path, tool_name: str
     if not hasattr(module, tool_name):
         return None, f"Tool '{tool_name}' not found in server '{server_name}'"
 
-    return getattr(module, tool_name), None
+    tool_obj = getattr(module, tool_name)
+
+    # FastMCP's @mcp.tool() decorator wraps functions in FunctionTool objects.
+    # Extract the original callable via .fn attribute.
+    if hasattr(tool_obj, 'fn') and callable(getattr(tool_obj, 'fn', None)):
+        return tool_obj.fn, None
+
+    if callable(tool_obj):
+        return tool_obj, None
+
+    return None, f"Tool '{tool_name}' in server '{server_name}' is not callable"
 
 
 def _discover_mcp_tool_allowlist(mcp_config: dict[str, dict]) -> list[str]:
@@ -974,6 +1009,24 @@ def get_server_url() -> str:
         return public_url.rstrip("/")
     if NGROK_PUBLIC_URL:
         return NGROK_PUBLIC_URL
+    return "http://localhost:8080"
+
+def get_webhook_base_url() -> str:
+    """Get base URL for webhook endpoints (PUBLIC_URL > ngrok > DB setting > localhost)."""
+    public_url = os.environ.get("PUBLIC_URL")
+    if public_url:
+        return public_url.rstrip("/")
+    if NGROK_PUBLIC_URL:
+        return NGROK_PUBLIC_URL
+    # Fall back to DB setting
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
+        conn.close()
+        if row:
+            return json.loads(row['value'])
+    except:
+        pass
     return "http://localhost:8080"
 
 def ensure_oauth_client() -> tuple[str, str]:
@@ -1135,6 +1188,7 @@ DASHBOARD_HTML = """
             <button class="tab active" onclick="showTab('manual-runs')">Manual Runs</button>
             <button class="tab" onclick="showTab('scheduled')">Scheduled</button>
             <button class="tab" onclick="showTab('webhooks')">Webhooks</button>
+            <button class="tab" onclick="showTab('tool-logs')">Tool Logs</button>
             <button class="tab" onclick="showTab('settings')">Settings</button>
         </div>
 
@@ -1184,6 +1238,35 @@ DASHBOARD_HTML = """
                             <tr><th>Name</th><th>URL</th><th>Triggers</th><th>Last Triggered</th><th>Status</th><th>Actions</th></tr>
                         </thead>
                         <tbody id="webhooks-table"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card" style="margin-top: var(--spacing-lg);">
+                <h2>Webhook Run History</h2>
+                <p style="color: var(--text-secondary); margin-bottom: var(--spacing-md); font-size: 13px;">
+                    Runs triggered by incoming webhook HTTP POST requests.
+                </p>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr><th>ID</th><th>Webhook</th><th>Started</th><th>Duration</th><th>Tokens</th><th>Cost</th><th>State</th><th>Output</th></tr>
+                        </thead>
+                        <tbody id="webhook-runs-table"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="tool-logs" class="section">
+            <div class="card">
+                <h2>Tool Invocation Logs</h2>
+                <p style="color: var(--text-secondary); margin-bottom: var(--spacing-md); font-size: 13px;">Recent invocations of internal MCP tools via invoke_internal_mcp_tool.</p>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr><th>Server</th><th>Tool</th><th>Status</th><th>Duration</th><th>Time</th><th>Actions</th></tr>
+                        </thead>
+                        <tbody id="tool-logs-table"></tbody>
                     </table>
                 </div>
             </div>
@@ -1278,6 +1361,7 @@ DASHBOARD_HTML = """
         let jobsData = [];
         let runsData = [];
         let webhooksData = [];
+        let toolLogsData = [];
         let livePollingInterval = null;
         let currentRunId = null;
         let confirmCallback = null;
@@ -1409,6 +1493,31 @@ DASHBOARD_HTML = """
                 </div>
             `;
             document.getElementById('output-modal').classList.add('active');
+        }
+
+        function showWebhookRuns(webhookId) {
+            // Switch to webhooks tab if not already there
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+            const webhooksNav = document.querySelector('.nav-item[onclick*="webhooks"]');
+            if (webhooksNav) webhooksNav.classList.add('active');
+            document.getElementById('webhooks').classList.add('active');
+
+            // Scroll to the webhook run history table
+            const table = document.getElementById('webhook-runs-table');
+            if (table) {
+                table.closest('.card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+
+            // Highlight matching rows briefly
+            const rows = table ? table.querySelectorAll('tr[data-webhook-id]') : [];
+            rows.forEach(row => {
+                row.style.transition = 'background-color 0.3s';
+                if (row.getAttribute('data-webhook-id') === webhookId) {
+                    row.style.backgroundColor = 'rgba(59, 130, 246, 0.15)';
+                    setTimeout(() => { row.style.backgroundColor = ''; }, 2000);
+                }
+            });
         }
 
         function renderMarkdown(text) {
@@ -1559,6 +1668,7 @@ DASHBOARD_HTML = """
 
         function renderRunModal(run) {
             const job = jobsData.find(j => j.id === run.job_id);
+            const webhook = run.webhook_id ? webhooksData.find(w => w.id === run.webhook_id) : null;
             const parsed = parseOutput(run.output);
             const isLive = run.state === 'running' || run.state === 'pending';
 
@@ -1579,8 +1689,22 @@ DASHBOARD_HTML = """
             const model = run.model || '-';
             const inputTokens = run.input_tokens || 0;
             const outputTokens = run.output_tokens || 0;
+            const cacheReadTokens = run.cache_read_tokens || 0;
+            const cacheCreationTokens = run.cache_creation_tokens || 0;
+            const webSearchRequests = run.web_search_requests || 0;
 
-            document.getElementById('modal-title').innerHTML = (job ? escapeHtml(job.name) : 'Run ' + run.id) + ' ' + liveIndicator;
+            const modalTitle = document.getElementById('modal-title');
+            modalTitle.textContent = '';
+            modalTitle.appendChild(document.createTextNode((job ? job.name : 'Run ' + run.id) + ' '));
+            if (isLive) {
+                const liveBadge = document.createElement('span');
+                liveBadge.className = 'live-badge';
+                const liveDot = document.createElement('span');
+                liveDot.className = 'live-dot';
+                liveBadge.appendChild(liveDot);
+                liveBadge.appendChild(document.createTextNode('LIVE'));
+                modalTitle.appendChild(liveBadge);
+            }
             document.getElementById('modal-body').innerHTML = `
                 <div class="modal-section">
                     <div class="meta-grid">
@@ -1613,9 +1737,21 @@ DASHBOARD_HTML = """
                             <span>${tokens > 0 ? tokens.toLocaleString() : '-'} ${tokens > 0 ? '(' + inputTokens.toLocaleString() + ' in / ' + outputTokens.toLocaleString() + ' out)' : ''}</span>
                         </div>
                         <div class="meta-item">
+                            <label>Cache Tokens</label>
+                            <span>${(cacheReadTokens > 0 || cacheCreationTokens > 0) ? cacheReadTokens.toLocaleString() + ' read / ' + cacheCreationTokens.toLocaleString() + ' created' : '-'}</span>
+                        </div>
+                        <div class="meta-item">
+                            <label>Web Searches</label>
+                            <span>${webSearchRequests > 0 ? webSearchRequests.toLocaleString() : '-'}</span>
+                        </div>
+                        <div class="meta-item">
                             <label>Cost</label>
                             <span style="color: ${cost > 0 ? '#28a745' : 'inherit'}; font-weight: ${cost > 0 ? '600' : 'inherit'};">${cost > 0 ? '$' + cost.toFixed(4) : '-'}</span>
                         </div>
+                        ${webhook ? `<div class="meta-item">
+                            <label>Webhook</label>
+                            <span>${escapeHtml(webhook.name)}</span>
+                        </div>` : ''}
                     </div>
                 </div>
                 <div class="modal-section">
@@ -1689,6 +1825,40 @@ DASHBOARD_HTML = """
             }
         }
 
+        function showToolLogDetails(logId) {
+            const log = toolLogsData.find(l => l.id === logId);
+            if (!log) return;
+
+            const modalTitle = document.getElementById('modal-title');
+            modalTitle.textContent = 'Tool Log: ' + log.server_name + '.' + log.tool_name;
+
+            let payloadFormatted = '';
+            try { payloadFormatted = JSON.stringify(JSON.parse(log.payload || '{}'), null, 2); }
+            catch(e) { payloadFormatted = log.payload || '(none)'; }
+
+            let resultSection = '';
+            if (log.status === 'error' && log.error) {
+                resultSection = '<div class="modal-section"><h4>Error</h4><div class="result-text error-text">' + escapeHtml(log.error) + '</div></div>';
+            } else if (log.result) {
+                let resultFormatted = '';
+                try { resultFormatted = JSON.stringify(JSON.parse(log.result), null, 2); }
+                catch(e) { resultFormatted = log.result; }
+                resultSection = '<div class="modal-section"><h4>Result</h4><pre class="result-text">' + escapeHtml(resultFormatted) + '</pre></div>';
+            }
+
+            document.getElementById('modal-body').innerHTML = '<div class="modal-section"><div class="meta-grid">'
+                + '<div class="meta-item"><label>Server</label><span>' + escapeHtml(log.server_name) + '</span></div>'
+                + '<div class="meta-item"><label>Tool</label><span>' + escapeHtml(log.tool_name) + '</span></div>'
+                + '<div class="meta-item"><label>Status</label><span class="status ' + (log.status === 'success' ? 'finished' : 'error') + '">' + escapeHtml(log.status) + '</span></div>'
+                + '<div class="meta-item"><label>Duration</label><span>' + log.duration_ms.toFixed(0) + 'ms</span></div>'
+                + '<div class="meta-item"><label>Timestamp</label><span>' + new Date(log.created_at).toLocaleString() + '</span></div>'
+                + '</div></div>'
+                + '<div class="modal-section"><h4>Payload</h4><pre class="result-text">' + escapeHtml(payloadFormatted) + '</pre></div>'
+                + resultSection;
+
+            document.getElementById('output-modal').classList.add('active');
+        }
+
         function closeModal() {
             stopLivePolling();
             document.getElementById('output-modal').classList.remove('active');
@@ -1703,14 +1873,16 @@ DASHBOARD_HTML = """
         });
 
         async function refresh() {
-            const [jobsRes, runsRes, webhooksRes] = await Promise.all([
+            const [jobsRes, runsRes, webhooksRes, toolLogsRes] = await Promise.all([
                 fetch('/api/jobs').then(r => r.json()),
                 fetch('/api/runs').then(r => r.json()),
-                fetch('/api/webhooks').then(r => r.json())
+                fetch('/api/webhooks').then(r => r.json()),
+                fetch('/api/tool-logs').then(r => r.json())
             ]);
             jobsData = jobsRes;
             runsData = runsRes;
             webhooksData = webhooksRes;
+            toolLogsData = toolLogsRes;
 
             // Helper to determine run type based on job cron field
             function getRunType(run) {
@@ -1806,6 +1978,34 @@ DASHBOARD_HTML = """
                 </tr>
             `}).join('');
 
+            // Render webhook runs in table (follows same escapeHtml pattern as scheduled runs above)
+            document.getElementById('webhook-runs-table').innerHTML = webhookRuns.length === 0
+                ? '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: var(--spacing-lg);">No webhook-triggered runs yet.</td></tr>'
+                : webhookRuns.map(r => {
+                const job = jobsData.find(j => j.id === r.job_id);
+                const webhook = webhooksData.find(w => w.id === r.webhook_id);
+                const webhookName = webhook ? webhook.name : (job ? job.name : r.webhook_id ? r.webhook_id.substring(0, 8) : 'Unknown');
+                const summary = getResultSummary(r.output, r.error);
+                const tokens = r.total_tokens || 0;
+                const cost = r.cost_usd || 0;
+                const isRunning = r.state === 'running' || r.state === 'pending';
+                return `
+                <tr data-webhook-id="${r.webhook_id || ''}">
+                    <td><code style="color: var(--accent-cyan);">${r.id.substring(0, 8)}</code></td>
+                    <td>${escapeHtml(webhookName)}</td>
+                    <td style="color: var(--text-secondary);">${new Date(r.started_at).toLocaleString()}</td>
+                    <td>${formatDuration(r.started_at, r.finished_at)}</td>
+                    <td>${tokens > 0 ? tokens.toLocaleString() : '-'}</td>
+                    <td>${cost > 0 ? '$' + cost.toFixed(4) : '-'}</td>
+                    <td><span class="status ${r.state}">${isRunning ? '<span class="live-dot"></span>' : ''}${r.state}</span></td>
+                    <td>
+                        <div class="output-summary">${escapeHtml(summary.text)}</div>
+                        <button class="view-btn" onclick="event.stopPropagation(); showRunDetails('${r.id}')">View</button>
+                        ${isRunning ? `<button class="delete-btn" style="margin-left: 5px;" onclick="event.stopPropagation(); killRun('${r.id}')">Kill</button>` : ''}
+                    </td>
+                </tr>
+            `}).join('');
+
             // Render webhooks
             document.getElementById('webhooks-table').innerHTML = webhooksRes.length === 0
                 ? '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: var(--spacing-lg);">No webhooks configured. Create one using the MCP tool.</td></tr>'
@@ -1824,9 +2024,69 @@ DASHBOARD_HTML = """
                     <td><span class="status ${w.enabled ? 'enabled' : 'disabled'}">${w.enabled ? 'Active' : 'Disabled'}</span></td>
                     <td>
                         <button class="view-btn" onclick="viewWebhookPrompt('${w.id}')">View Prompt</button>
+                        <button class="view-btn" style="margin-left: 5px;" onclick="showWebhookRuns('${w.id}')">View Runs</button>
                     </td>
                 </tr>
             `).join('');
+
+            // Render tool logs table
+            const toolLogsTable = document.getElementById('tool-logs-table');
+            if (toolLogsRes.length === 0) {
+                toolLogsTable.textContent = '';
+                const emptyRow = document.createElement('tr');
+                const emptyCell = document.createElement('td');
+                emptyCell.colSpan = 6;
+                emptyCell.style.cssText = 'text-align: center; color: var(--text-muted); padding: var(--spacing-lg);';
+                emptyCell.textContent = 'No tool invocations logged yet.';
+                emptyRow.appendChild(emptyCell);
+                toolLogsTable.appendChild(emptyRow);
+            } else {
+                toolLogsTable.textContent = '';
+                toolLogsRes.forEach(l => {
+                    const row = document.createElement('tr');
+
+                    const serverCell = document.createElement('td');
+                    const serverStrong = document.createElement('strong');
+                    serverStrong.style.color = 'var(--text-primary)';
+                    serverStrong.textContent = l.server_name;
+                    serverCell.appendChild(serverStrong);
+                    row.appendChild(serverCell);
+
+                    const toolCell = document.createElement('td');
+                    const toolCode = document.createElement('code');
+                    toolCode.style.cssText = 'font-size: 12px; color: var(--accent-cyan);';
+                    toolCode.textContent = l.tool_name;
+                    toolCell.appendChild(toolCode);
+                    row.appendChild(toolCell);
+
+                    const statusCell = document.createElement('td');
+                    const statusSpan = document.createElement('span');
+                    statusSpan.className = 'status ' + (l.status === 'success' ? 'finished' : 'error');
+                    statusSpan.textContent = l.status;
+                    statusCell.appendChild(statusSpan);
+                    row.appendChild(statusCell);
+
+                    const durationCell = document.createElement('td');
+                    durationCell.style.color = 'var(--text-secondary)';
+                    durationCell.textContent = l.duration_ms.toFixed(0) + 'ms';
+                    row.appendChild(durationCell);
+
+                    const timeCell = document.createElement('td');
+                    timeCell.style.color = 'var(--text-secondary)';
+                    timeCell.textContent = timeAgo(l.created_at);
+                    row.appendChild(timeCell);
+
+                    const actionsCell = document.createElement('td');
+                    const viewBtn = document.createElement('button');
+                    viewBtn.className = 'view-btn';
+                    viewBtn.textContent = 'View';
+                    viewBtn.addEventListener('click', () => showToolLogDetails(l.id));
+                    actionsCell.appendChild(viewBtn);
+                    row.appendChild(actionsCell);
+
+                    toolLogsTable.appendChild(row);
+                });
+            }
 
             document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
 
@@ -2746,17 +3006,9 @@ async def api_webhooks_handler(request):
     """List all webhooks for dashboard"""
     conn = get_db()
     webhooks = conn.execute("SELECT * FROM webhooks ORDER BY created_at DESC").fetchall()
-
-    # Get base URL
-    base_url = "http://localhost:8080"
-    row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
-    if row:
-        try:
-            base_url = json.loads(row['value'])
-        except:
-            pass
     conn.close()
 
+    base_url = get_webhook_base_url()
     result = []
     for w in webhooks:
         webhook_dict = dict(w)
@@ -2765,65 +3017,79 @@ async def api_webhooks_handler(request):
 
     return JSONResponse(result)
 
+@require_auth
+async def api_tool_logs_handler(request):
+    """List recent tool invocation logs for dashboard"""
+    conn = get_db()
+    logs = conn.execute("SELECT * FROM tool_logs ORDER BY created_at DESC LIMIT 100").fetchall()
+    conn.close()
+    return JSONResponse([dict(l) for l in logs])
+
 async def webhook_trigger_handler(request):
     """Handle incoming webhook POST requests"""
     token = request.path_params.get("token")
 
     conn = get_db()
-    webhook = conn.execute("SELECT * FROM webhooks WHERE secret_token = ?", (token,)).fetchone()
-
-    if not webhook:
-        conn.close()
-        return JSONResponse({"error": "Webhook not found"}, status_code=404)
-
-    if not webhook["enabled"]:
-        conn.close()
-        return JSONResponse({"error": "Webhook is disabled"}, status_code=403)
-
-    # Parse JSON payload
     try:
-        payload = await request.json()
-    except:
-        payload = {}
+        webhook = conn.execute("SELECT * FROM webhooks WHERE secret_token = ?", (token,)).fetchone()
 
-    # Render the prompt template with payload data
-    prompt = render_webhook_template(webhook["prompt_template"], payload)
+        if not webhook:
+            return JSONResponse({"error": "Webhook not found"}, status_code=404)
 
-    # Create a disabled job for this webhook run (follows quick-run pattern)
-    job_id = str(uuid.uuid4())[:8]
-    now = utc_now_iso()
+        if not webhook["enabled"]:
+            return JSONResponse({"error": "Webhook is disabled"}, status_code=403)
 
-    conn.execute("""
-        INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (job_id, f"Webhook: {webhook['name']} ({now[:16]})", "webhook", prompt, "claude", "[]", "{}", 0, now, now))
-    conn.commit()
+        print(f"[webhook] Trigger received for '{webhook['name']}' (id={webhook['id']})", file=sys.stderr)
 
-    # Create the run with webhook_id
-    run_id = str(uuid.uuid4())[:8]
-    conn.execute("""
-        INSERT INTO runs (id, job_id, started_at, prompt, command, state, webhook_id)
-        VALUES (?, ?, ?, ?, ?, 'pending', ?)
-    """, (run_id, job_id, now, prompt, "claude", webhook["id"]))
-    conn.commit()
+        # Parse JSON payload
+        try:
+            payload = await request.json()
+        except:
+            payload = {}
 
-    # Update webhook stats
-    conn.execute("""
-        UPDATE webhooks SET
-            last_triggered_at = ?,
-            trigger_count = trigger_count + 1
-        WHERE id = ?
-    """, (now, webhook["id"]))
-    conn.commit()
-    conn.close()
+        # Render the prompt template with payload data
+        prompt = render_webhook_template(webhook["prompt_template"], payload)
 
-    # Run will be picked up by run_processor_loop (within 5 seconds)
-    return JSONResponse({
-        "success": True,
-        "run_id": run_id,
-        "webhook_id": webhook["id"],
-        "message": "Webhook triggered successfully"
-    })
+        # Create a disabled job for this webhook run (follows quick-run pattern)
+        job_id = str(uuid.uuid4())[:8]
+        now = utc_now_iso()
+
+        conn.execute("""
+            INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (job_id, f"Webhook: {webhook['name']} ({now[:16]})", "webhook", prompt, "claude", "[]", "{}", 0, now, now))
+
+        # Create the run with webhook_id
+        run_id = str(uuid.uuid4())[:8]
+        conn.execute("""
+            INSERT INTO runs (id, job_id, started_at, prompt, command, state, webhook_id)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        """, (run_id, job_id, now, prompt, "claude", webhook["id"]))
+
+        # Update webhook stats
+        conn.execute("""
+            UPDATE webhooks SET
+                last_triggered_at = ?,
+                trigger_count = trigger_count + 1
+            WHERE id = ?
+        """, (now, webhook["id"]))
+
+        conn.commit()
+
+        print(f"[webhook] Created run {run_id} for webhook '{webhook['name']}' (job_id={job_id})", file=sys.stderr)
+
+        # Run will be picked up by run_processor_loop (within 5 seconds)
+        return JSONResponse({
+            "success": True,
+            "run_id": run_id,
+            "webhook_id": webhook["id"],
+            "message": "Webhook triggered successfully"
+        })
+    except Exception as e:
+        print(f"[webhook] Error triggering webhook (token={token[:8]}...): {e}", file=sys.stderr)
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        conn.close()
 
 @require_auth
 async def api_delete_job_handler(request):
@@ -3222,16 +3488,134 @@ class OAuthMiddleware:
         # Continue to the actual app
         await self.app(scope, receive, send)
 
+@require_auth
+async def api_create_job_handler(request):
+    """Create a new job via REST API"""
+    try:
+        body = await request.json()
+        name = body.get('name', '').strip()
+        cron = body.get('cron', '').strip()
+        prompt = body.get('prompt', '').strip()
+        command = body.get('command', 'claude')
+        tools = body.get('tools', '[]')
+        environment = body.get('environment', '{}')
+        timeout_minutes = body.get('timeout_minutes', 30)
+
+        if not name:
+            return JSONResponse({"error": "name is required"}, status_code=400)
+        if not cron:
+            return JSONResponse({"error": "cron is required"}, status_code=400)
+        if not prompt:
+            return JSONResponse({"error": "prompt is required"}, status_code=400)
+
+        if isinstance(tools, list):
+            tools = json.dumps(tools)
+        if isinstance(environment, dict):
+            environment = json.dumps(environment)
+
+        result = json.loads(create_job(name, cron, prompt, command, tools, environment, timeout_minutes))
+        if "error" in result:
+            return JSONResponse(result, status_code=400)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@require_auth
+async def api_get_job_handler(request):
+    """Get a single job by ID"""
+    job_id = request.path_params['job_id']
+    conn = get_db()
+    job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    conn.close()
+    if not job:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    return JSONResponse(dict(job))
+
+@require_auth
+async def api_update_job_handler(request):
+    """Update a job via REST API"""
+    job_id = request.path_params['job_id']
+    try:
+        body = await request.json()
+        name = body.get('name')
+        cron = body.get('cron')
+        prompt = body.get('prompt')
+        enabled = body.get('enabled')
+        timeout_minutes = body.get('timeout_minutes')
+        tools = body.get('tools')
+
+        if tools is not None and isinstance(tools, list):
+            tools = json.dumps(tools)
+
+        result = json.loads(update_job(job_id, name=name, cron=cron, prompt=prompt, enabled=enabled, timeout_minutes=timeout_minutes, tools=tools))
+        if "error" in result:
+            return JSONResponse(result, status_code=400)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@require_auth
+async def api_trigger_job_handler(request):
+    """Trigger a job to run immediately via REST API"""
+    job_id = request.path_params['job_id']
+    result = json.loads(trigger_job(job_id))
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return JSONResponse(result)
+
+class CORSMiddleware:
+    """Simple CORS middleware for cross-origin requests from the SFLOW demo app."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        from starlette.requests import Request
+        request = Request(scope, receive)
+        origin = request.headers.get("origin", "")
+
+        if request.method == "OPTIONS":
+            response = Response(
+                status_code=204,
+                headers={
+                    "Access-Control-Allow-Origin": origin or "*",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type, ngrok-skip-browser-warning",
+                    "Access-Control-Max-Age": "86400",
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                headers = dict(message.get("headers", []))
+                cors_headers = [
+                    (b"access-control-allow-origin", (origin or "*").encode()),
+                    (b"access-control-allow-credentials", b"true"),
+                ]
+                message["headers"] = list(message.get("headers", [])) + cors_headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors)
+
 dashboard_routes = [
     Route("/", dashboard_handler),
     Route("/dashboard", dashboard_handler),
     Route("/static/{filename}", static_file_handler),
-    Route("/api/jobs", api_jobs_handler),
+    Route("/api/jobs", api_jobs_handler, methods=["GET"]),
+    Route("/api/jobs", api_create_job_handler, methods=["POST"]),
     Route("/api/runs", api_runs_handler),
     Route("/api/run/{run_id}", api_run_detail_handler),
     Route("/api/run/{run_id}/kill", api_kill_run_handler, methods=["POST"]),
     Route("/api/run-prompt", api_run_prompt_handler, methods=["POST"]),
+    Route("/api/job/{job_id}", api_get_job_handler, methods=["GET"]),
+    Route("/api/job/{job_id}", api_update_job_handler, methods=["PUT"]),
     Route("/api/job/{job_id}", api_delete_job_handler, methods=["DELETE"]),
+    Route("/api/job/{job_id}/trigger", api_trigger_job_handler, methods=["POST"]),
     Route("/api/stats", api_stats_handler),
     Route("/api/ngrok", api_ngrok_handler),
     Route("/api/settings", api_settings_get_handler, methods=["GET"]),
@@ -3243,6 +3627,7 @@ dashboard_routes = [
     Route("/api/fixed-server-toggle", api_fixed_server_toggle_handler, methods=["POST"]),
     Route("/api/dynamic-server-toggle", api_dynamic_server_toggle_handler, methods=["POST"]),
     Route("/api/webhooks", api_webhooks_handler),
+    Route("/api/tool-logs", api_tool_logs_handler),
     Route("/webhook/{token}", webhook_trigger_handler, methods=["POST"]),
     # OAuth 2.1 endpoints
     Route("/.well-known/oauth-protected-resource", oauth_protected_resource_handler),
@@ -3498,16 +3883,9 @@ def create_webhook(name: str, prompt_template: str, description: str = "") -> st
     """, (webhook_id, name, description, secret_token, prompt_template, now, now))
     conn.commit()
 
-    # Get base URL from settings
-    base_url = "http://localhost:8080"
-    row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
-    if row:
-        try:
-            base_url = json.loads(row['value'])
-        except:
-            pass
     conn.close()
 
+    base_url = get_webhook_base_url()
     webhook_url = f"{base_url}/webhook/{secret_token}"
 
     return json.dumps({
@@ -3523,17 +3901,9 @@ def list_webhooks() -> str:
     """List all webhook endpoints"""
     conn = get_db()
     webhooks = conn.execute("SELECT * FROM webhooks ORDER BY created_at DESC").fetchall()
-
-    # Get base URL for display
-    base_url = "http://localhost:8080"
-    row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
-    if row:
-        try:
-            base_url = json.loads(row['value'])
-        except:
-            pass
     conn.close()
 
+    base_url = get_webhook_base_url()
     result = []
     for w in webhooks:
         webhook_dict = dict(w)
@@ -3551,16 +3921,9 @@ def get_webhook(webhook_id: str) -> str:
         conn.close()
         return json.dumps({"error": "Webhook not found"})
 
-    # Get base URL
-    base_url = "http://localhost:8080"
-    row = conn.execute("SELECT value FROM settings WHERE key = 'webhook_base_url'").fetchone()
-    if row:
-        try:
-            base_url = json.loads(row['value'])
-        except:
-            pass
     conn.close()
 
+    base_url = get_webhook_base_url()
     result = dict(webhook)
     result['url'] = f"{base_url}/webhook/{webhook['secret_token']}"
     return json.dumps(result, indent=2)
@@ -4138,6 +4501,10 @@ async def invoke_internal_mcp_tool(tool: str, payload: str = "{}") -> str:
         return json.dumps({"error": f"Invalid MCP tool format '{normalized_tool}'"})
 
     server_name, tool_name = parts[1], parts[2]
+    start_time = time.time()
+    log_result = None
+    log_error = None
+    log_status = "success"
 
     enabled_servers = _get_mcp_servers_setting()
     if not any(s.get("name") == server_name for s in enabled_servers):
@@ -4188,21 +4555,44 @@ async def invoke_internal_mcp_tool(tool: str, payload: str = "{}") -> str:
     try:
         tool_func, error = _load_mcp_tool_from_file(server_name, server_path, tool_name)
         if error:
+            log_error = error
+            log_status = "error"
             return json.dumps({"error": error})
 
         result = tool_func(*args, **kwargs)
         if inspect.isawaitable(result):
             result = await result
+        log_result = result
     except TypeError as e:
-        return json.dumps({"error": f"Tool invocation failed: {e}"})
+        log_error = f"Tool invocation failed: {e}"
+        log_status = "error"
+        return json.dumps({"error": log_error})
     except Exception as e:
-        return json.dumps({"error": f"Tool execution error: {e}"})
+        log_error = f"Tool execution error: {e}"
+        log_status = "error"
+        return json.dumps({"error": log_error})
     finally:
         for key, prev in previous_env.items():
             if prev is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = prev
+
+        # Log tool invocation to database
+        duration_ms = (time.time() - start_time) * 1000
+        try:
+            result_str = json.dumps(log_result, default=str) if log_result is not None else None
+            if result_str and len(result_str) > 10240:
+                result_str = result_str[:10240] + "... (truncated)"
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO tool_logs (id, server_name, tool_name, payload, result, error, status, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), server_name, tool_name, payload, result_str, log_error, log_status, round(duration_ms, 2), datetime.now(timezone.utc).isoformat())
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
     response = {"success": True, "tool": normalized_tool, "result": result}
     if warning:
@@ -4511,8 +4901,12 @@ You are restricted to working only within the claude_playground directory.
             "output_tokens": 0,
             "total_tokens": 0,
             "cost_usd": 0.0,
-            "model": None
+            "model": None,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "web_search_requests": 0,
         }
+        processed_ids = set()  # Deduplicate messages (parallel tool uses share IDs)
         final_result = None
 
         print(f"[execute_run] Starting SDK query for run {run_id} (v2 - JSON output)", file=sys.stderr)
@@ -4550,22 +4944,50 @@ You are restricted to working only within the claude_playground directory.
                             for block in nested_content:
                                 output_parts.append(serialize_content_block(block))
 
-                    # Capture token usage from system messages
+                    # Capture token usage from system messages (deduplicate by message ID)
+                    msg_id = getattr(message, 'id', None)
                     if hasattr(message, 'usage') and message.usage:
-                        u = message.usage
-                        if hasattr(u, 'input_tokens'):
-                            usage["input_tokens"] = u.input_tokens
-                        elif isinstance(u, dict):
-                            usage["input_tokens"] = u.get("input_tokens", usage["input_tokens"])
+                        if msg_id is None or msg_id not in processed_ids:
+                            if msg_id is not None:
+                                processed_ids.add(msg_id)
+                            u = message.usage
+                            if hasattr(u, 'input_tokens'):
+                                usage["input_tokens"] = u.input_tokens
+                            elif isinstance(u, dict):
+                                usage["input_tokens"] = u.get("input_tokens", usage["input_tokens"])
 
-                        if hasattr(u, 'output_tokens'):
-                            usage["output_tokens"] = u.output_tokens
-                        elif isinstance(u, dict):
-                            usage["output_tokens"] = u.get("output_tokens", usage["output_tokens"])
+                            if hasattr(u, 'output_tokens'):
+                                usage["output_tokens"] = u.output_tokens
+                            elif isinstance(u, dict):
+                                usage["output_tokens"] = u.get("output_tokens", usage["output_tokens"])
+
+                            # Capture cache token usage
+                            cache_read = getattr(u, 'cache_read_input_tokens', None) or (u.get('cache_read_input_tokens') if isinstance(u, dict) else None)
+                            if cache_read:
+                                usage["cache_read_tokens"] = cache_read
+                            cache_creation = getattr(u, 'cache_creation_input_tokens', None) or (u.get('cache_creation_input_tokens') if isinstance(u, dict) else None)
+                            if cache_creation:
+                                usage["cache_creation_tokens"] = cache_creation
 
                     # Capture model info
                     if hasattr(message, 'model') and message.model:
                         usage["model"] = message.model
+
+                    # Capture authoritative cost from SDK ResultMessage
+                    if hasattr(message, 'total_cost_usd') and message.total_cost_usd:
+                        usage["cost_usd"] = message.total_cost_usd
+                    if hasattr(message, 'model_usage') and message.model_usage:
+                        # model_usage may contain per-model breakdown; extract web search count if available
+                        mu = message.model_usage
+                        if isinstance(mu, dict):
+                            for model_info in mu.values():
+                                if isinstance(model_info, dict):
+                                    usage["web_search_requests"] += model_info.get('web_search_requests', 0)
+                        elif hasattr(mu, '__iter__'):
+                            for model_info in mu:
+                                ws = getattr(model_info, 'web_search_requests', 0)
+                                if ws:
+                                    usage["web_search_requests"] += ws
 
                     # Capture final result
                     if hasattr(message, 'result') and message.result:
@@ -4602,8 +5024,8 @@ You are restricted to working only within the claude_playground directory.
         # Calculate total tokens
         usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
 
-        # Calculate cost using pricing table
-        if usage["input_tokens"] > 0 or usage["output_tokens"] > 0:
+        # Only calculate cost manually if SDK didn't provide authoritative total_cost_usd
+        if usage["cost_usd"] == 0.0 and (usage["input_tokens"] > 0 or usage["output_tokens"] > 0):
             model = usage["model"] or "default"
             pricing = PRICING.get(model, PRICING["default"])
             input_cost = (usage["input_tokens"] / 1_000_000) * pricing["input"]
@@ -4622,11 +5044,16 @@ You are restricted to working only within the claude_playground directory.
                 output_tokens = ?,
                 total_tokens = ?,
                 cost_usd = ?,
-                model = ?
+                model = ?,
+                cache_read_tokens = ?,
+                cache_creation_tokens = ?,
+                web_search_requests = ?
             WHERE id = ?
         """, (now, output, 0, "finished",
               usage["input_tokens"], usage["output_tokens"], usage["total_tokens"],
-              usage["cost_usd"], usage["model"], run_id))
+              usage["cost_usd"], usage["model"],
+              usage["cache_read_tokens"], usage["cache_creation_tokens"],
+              usage["web_search_requests"], run_id))
 
         # Update job's last_executed_at
         conn.execute("""
@@ -4807,8 +5234,8 @@ def main():
 
         base_app = mcp.http_app(path='/sse')  # Serve MCP at /sse for Claude connector
         base_app.routes.extend(dashboard_routes)
-        # Wrap with OAuth middleware to protect /sse endpoint
-        app = OAuthMiddleware(base_app)
+        # Wrap with OAuth middleware to protect /sse endpoint, then add CORS
+        app = CORSMiddleware(OAuthMiddleware(base_app))
 
         def run_sse_server():
             """Run SSE server in its own event loop"""
@@ -4881,8 +5308,8 @@ def main():
 
         base_app = mcp.http_app(path='/sse')  # Serve MCP at /sse for Claude connector
         base_app.routes.extend(dashboard_routes)
-        # Wrap with OAuth middleware to protect /sse endpoint
-        app = OAuthMiddleware(base_app)
+        # Wrap with OAuth middleware to protect /sse endpoint, then add CORS
+        app = CORSMiddleware(OAuthMiddleware(base_app))
 
         dashboard_url = "http://localhost:8080/"
         print(f"Dashboard available at {dashboard_url}", file=sys.stderr)
