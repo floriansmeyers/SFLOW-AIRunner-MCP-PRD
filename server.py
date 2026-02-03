@@ -877,7 +877,17 @@ def _load_mcp_tool_from_file(server_name: str, server_path: Path, tool_name: str
     if not hasattr(module, tool_name):
         return None, f"Tool '{tool_name}' not found in server '{server_name}'"
 
-    return getattr(module, tool_name), None
+    tool_obj = getattr(module, tool_name)
+
+    # FastMCP's @mcp.tool() decorator wraps functions in FunctionTool objects.
+    # Extract the original callable via .fn attribute.
+    if hasattr(tool_obj, 'fn') and callable(getattr(tool_obj, 'fn', None)):
+        return tool_obj.fn, None
+
+    if callable(tool_obj):
+        return tool_obj, None
+
+    return None, f"Tool '{tool_name}' in server '{server_name}' is not callable"
 
 
 def _discover_mcp_tool_allowlist(mcp_config: dict[str, dict]) -> list[str]:
