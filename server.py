@@ -372,6 +372,19 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_webhooks_token ON webhooks(secret_token);
 
+        CREATE TABLE IF NOT EXISTS tool_logs (
+            id TEXT PRIMARY KEY,
+            server_name TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            payload TEXT,
+            result TEXT,
+            error TEXT,
+            status TEXT DEFAULT 'success',
+            duration_ms REAL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_tool_logs_created ON tool_logs(created_at);
+
         -- OAuth 2.1 tables for MCP authentication
         CREATE TABLE IF NOT EXISTS oauth_clients (
             client_id TEXT PRIMARY KEY,
@@ -1157,6 +1170,7 @@ DASHBOARD_HTML = """
             <button class="tab active" onclick="showTab('manual-runs')">Manual Runs</button>
             <button class="tab" onclick="showTab('scheduled')">Scheduled</button>
             <button class="tab" onclick="showTab('webhooks')">Webhooks</button>
+            <button class="tab" onclick="showTab('tool-logs')">Tool Logs</button>
             <button class="tab" onclick="showTab('settings')">Settings</button>
         </div>
 
@@ -1206,6 +1220,21 @@ DASHBOARD_HTML = """
                             <tr><th>Name</th><th>URL</th><th>Triggers</th><th>Last Triggered</th><th>Status</th><th>Actions</th></tr>
                         </thead>
                         <tbody id="webhooks-table"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="tool-logs" class="section">
+            <div class="card">
+                <h2>Tool Invocation Logs</h2>
+                <p style="color: var(--text-secondary); margin-bottom: var(--spacing-md); font-size: 13px;">Recent invocations of internal MCP tools via invoke_internal_mcp_tool.</p>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr><th>Server</th><th>Tool</th><th>Status</th><th>Duration</th><th>Time</th><th>Actions</th></tr>
+                        </thead>
+                        <tbody id="tool-logs-table"></tbody>
                     </table>
                 </div>
             </div>
@@ -1300,6 +1329,7 @@ DASHBOARD_HTML = """
         let jobsData = [];
         let runsData = [];
         let webhooksData = [];
+        let toolLogsData = [];
         let livePollingInterval = null;
         let currentRunId = null;
         let confirmCallback = null;
@@ -1733,6 +1763,40 @@ DASHBOARD_HTML = """
             }
         }
 
+        function showToolLogDetails(logId) {
+            const log = toolLogsData.find(l => l.id === logId);
+            if (!log) return;
+
+            const modalTitle = document.getElementById('modal-title');
+            modalTitle.textContent = 'Tool Log: ' + log.server_name + '.' + log.tool_name;
+
+            let payloadFormatted = '';
+            try { payloadFormatted = JSON.stringify(JSON.parse(log.payload || '{}'), null, 2); }
+            catch(e) { payloadFormatted = log.payload || '(none)'; }
+
+            let resultSection = '';
+            if (log.status === 'error' && log.error) {
+                resultSection = '<div class="modal-section"><h4>Error</h4><div class="result-text error-text">' + escapeHtml(log.error) + '</div></div>';
+            } else if (log.result) {
+                let resultFormatted = '';
+                try { resultFormatted = JSON.stringify(JSON.parse(log.result), null, 2); }
+                catch(e) { resultFormatted = log.result; }
+                resultSection = '<div class="modal-section"><h4>Result</h4><pre class="result-text">' + escapeHtml(resultFormatted) + '</pre></div>';
+            }
+
+            document.getElementById('modal-body').innerHTML = '<div class="modal-section"><div class="meta-grid">'
+                + '<div class="meta-item"><label>Server</label><span>' + escapeHtml(log.server_name) + '</span></div>'
+                + '<div class="meta-item"><label>Tool</label><span>' + escapeHtml(log.tool_name) + '</span></div>'
+                + '<div class="meta-item"><label>Status</label><span class="status ' + (log.status === 'success' ? 'finished' : 'error') + '">' + escapeHtml(log.status) + '</span></div>'
+                + '<div class="meta-item"><label>Duration</label><span>' + log.duration_ms.toFixed(0) + 'ms</span></div>'
+                + '<div class="meta-item"><label>Timestamp</label><span>' + new Date(log.created_at).toLocaleString() + '</span></div>'
+                + '</div></div>'
+                + '<div class="modal-section"><h4>Payload</h4><pre class="result-text">' + escapeHtml(payloadFormatted) + '</pre></div>'
+                + resultSection;
+
+            document.getElementById('output-modal').classList.add('active');
+        }
+
         function closeModal() {
             stopLivePolling();
             document.getElementById('output-modal').classList.remove('active');
@@ -1747,14 +1811,16 @@ DASHBOARD_HTML = """
         });
 
         async function refresh() {
-            const [jobsRes, runsRes, webhooksRes] = await Promise.all([
+            const [jobsRes, runsRes, webhooksRes, toolLogsRes] = await Promise.all([
                 fetch('/api/jobs').then(r => r.json()),
                 fetch('/api/runs').then(r => r.json()),
-                fetch('/api/webhooks').then(r => r.json())
+                fetch('/api/webhooks').then(r => r.json()),
+                fetch('/api/tool-logs').then(r => r.json())
             ]);
             jobsData = jobsRes;
             runsData = runsRes;
             webhooksData = webhooksRes;
+            toolLogsData = toolLogsRes;
 
             // Helper to determine run type based on job cron field
             function getRunType(run) {
@@ -1871,6 +1937,65 @@ DASHBOARD_HTML = """
                     </td>
                 </tr>
             `).join('');
+
+            // Render tool logs table
+            const toolLogsTable = document.getElementById('tool-logs-table');
+            if (toolLogsRes.length === 0) {
+                toolLogsTable.textContent = '';
+                const emptyRow = document.createElement('tr');
+                const emptyCell = document.createElement('td');
+                emptyCell.colSpan = 6;
+                emptyCell.style.cssText = 'text-align: center; color: var(--text-muted); padding: var(--spacing-lg);';
+                emptyCell.textContent = 'No tool invocations logged yet.';
+                emptyRow.appendChild(emptyCell);
+                toolLogsTable.appendChild(emptyRow);
+            } else {
+                toolLogsTable.textContent = '';
+                toolLogsRes.forEach(l => {
+                    const row = document.createElement('tr');
+
+                    const serverCell = document.createElement('td');
+                    const serverStrong = document.createElement('strong');
+                    serverStrong.style.color = 'var(--text-primary)';
+                    serverStrong.textContent = l.server_name;
+                    serverCell.appendChild(serverStrong);
+                    row.appendChild(serverCell);
+
+                    const toolCell = document.createElement('td');
+                    const toolCode = document.createElement('code');
+                    toolCode.style.cssText = 'font-size: 12px; color: var(--accent-cyan);';
+                    toolCode.textContent = l.tool_name;
+                    toolCell.appendChild(toolCode);
+                    row.appendChild(toolCell);
+
+                    const statusCell = document.createElement('td');
+                    const statusSpan = document.createElement('span');
+                    statusSpan.className = 'status ' + (l.status === 'success' ? 'finished' : 'error');
+                    statusSpan.textContent = l.status;
+                    statusCell.appendChild(statusSpan);
+                    row.appendChild(statusCell);
+
+                    const durationCell = document.createElement('td');
+                    durationCell.style.color = 'var(--text-secondary)';
+                    durationCell.textContent = l.duration_ms.toFixed(0) + 'ms';
+                    row.appendChild(durationCell);
+
+                    const timeCell = document.createElement('td');
+                    timeCell.style.color = 'var(--text-secondary)';
+                    timeCell.textContent = timeAgo(l.created_at);
+                    row.appendChild(timeCell);
+
+                    const actionsCell = document.createElement('td');
+                    const viewBtn = document.createElement('button');
+                    viewBtn.className = 'view-btn';
+                    viewBtn.textContent = 'View';
+                    viewBtn.addEventListener('click', () => showToolLogDetails(l.id));
+                    actionsCell.appendChild(viewBtn);
+                    row.appendChild(actionsCell);
+
+                    toolLogsTable.appendChild(row);
+                });
+            }
 
             document.getElementById('last-update').textContent = 'Updated ' + new Date().toLocaleTimeString();
 
@@ -2809,6 +2934,14 @@ async def api_webhooks_handler(request):
 
     return JSONResponse(result)
 
+@require_auth
+async def api_tool_logs_handler(request):
+    """List recent tool invocation logs for dashboard"""
+    conn = get_db()
+    logs = conn.execute("SELECT * FROM tool_logs ORDER BY created_at DESC LIMIT 100").fetchall()
+    conn.close()
+    return JSONResponse([dict(l) for l in logs])
+
 async def webhook_trigger_handler(request):
     """Handle incoming webhook POST requests"""
     token = request.path_params.get("token")
@@ -3266,16 +3399,134 @@ class OAuthMiddleware:
         # Continue to the actual app
         await self.app(scope, receive, send)
 
+@require_auth
+async def api_create_job_handler(request):
+    """Create a new job via REST API"""
+    try:
+        body = await request.json()
+        name = body.get('name', '').strip()
+        cron = body.get('cron', '').strip()
+        prompt = body.get('prompt', '').strip()
+        command = body.get('command', 'claude')
+        tools = body.get('tools', '[]')
+        environment = body.get('environment', '{}')
+        timeout_minutes = body.get('timeout_minutes', 30)
+
+        if not name:
+            return JSONResponse({"error": "name is required"}, status_code=400)
+        if not cron:
+            return JSONResponse({"error": "cron is required"}, status_code=400)
+        if not prompt:
+            return JSONResponse({"error": "prompt is required"}, status_code=400)
+
+        if isinstance(tools, list):
+            tools = json.dumps(tools)
+        if isinstance(environment, dict):
+            environment = json.dumps(environment)
+
+        result = json.loads(create_job(name, cron, prompt, command, tools, environment, timeout_minutes))
+        if "error" in result:
+            return JSONResponse(result, status_code=400)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@require_auth
+async def api_get_job_handler(request):
+    """Get a single job by ID"""
+    job_id = request.path_params['job_id']
+    conn = get_db()
+    job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    conn.close()
+    if not job:
+        return JSONResponse({"error": "Job not found"}, status_code=404)
+    return JSONResponse(dict(job))
+
+@require_auth
+async def api_update_job_handler(request):
+    """Update a job via REST API"""
+    job_id = request.path_params['job_id']
+    try:
+        body = await request.json()
+        name = body.get('name')
+        cron = body.get('cron')
+        prompt = body.get('prompt')
+        enabled = body.get('enabled')
+        timeout_minutes = body.get('timeout_minutes')
+        tools = body.get('tools')
+
+        if tools is not None and isinstance(tools, list):
+            tools = json.dumps(tools)
+
+        result = json.loads(update_job(job_id, name=name, cron=cron, prompt=prompt, enabled=enabled, timeout_minutes=timeout_minutes, tools=tools))
+        if "error" in result:
+            return JSONResponse(result, status_code=400)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@require_auth
+async def api_trigger_job_handler(request):
+    """Trigger a job to run immediately via REST API"""
+    job_id = request.path_params['job_id']
+    result = json.loads(trigger_job(job_id))
+    if "error" in result:
+        return JSONResponse(result, status_code=404)
+    return JSONResponse(result)
+
+class CORSMiddleware:
+    """Simple CORS middleware for cross-origin requests from the SFLOW demo app."""
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        from starlette.requests import Request
+        request = Request(scope, receive)
+        origin = request.headers.get("origin", "")
+
+        if request.method == "OPTIONS":
+            response = Response(
+                status_code=204,
+                headers={
+                    "Access-Control-Allow-Origin": origin or "*",
+                    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+                    "Access-Control-Allow-Headers": "Authorization, Content-Type, ngrok-skip-browser-warning",
+                    "Access-Control-Max-Age": "86400",
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                headers = dict(message.get("headers", []))
+                cors_headers = [
+                    (b"access-control-allow-origin", (origin or "*").encode()),
+                    (b"access-control-allow-credentials", b"true"),
+                ]
+                message["headers"] = list(message.get("headers", [])) + cors_headers
+            await send(message)
+
+        await self.app(scope, receive, send_with_cors)
+
 dashboard_routes = [
     Route("/", dashboard_handler),
     Route("/dashboard", dashboard_handler),
     Route("/static/{filename}", static_file_handler),
-    Route("/api/jobs", api_jobs_handler),
+    Route("/api/jobs", api_jobs_handler, methods=["GET"]),
+    Route("/api/jobs", api_create_job_handler, methods=["POST"]),
     Route("/api/runs", api_runs_handler),
     Route("/api/run/{run_id}", api_run_detail_handler),
     Route("/api/run/{run_id}/kill", api_kill_run_handler, methods=["POST"]),
     Route("/api/run-prompt", api_run_prompt_handler, methods=["POST"]),
+    Route("/api/job/{job_id}", api_get_job_handler, methods=["GET"]),
+    Route("/api/job/{job_id}", api_update_job_handler, methods=["PUT"]),
     Route("/api/job/{job_id}", api_delete_job_handler, methods=["DELETE"]),
+    Route("/api/job/{job_id}/trigger", api_trigger_job_handler, methods=["POST"]),
     Route("/api/stats", api_stats_handler),
     Route("/api/ngrok", api_ngrok_handler),
     Route("/api/settings", api_settings_get_handler, methods=["GET"]),
@@ -3287,6 +3538,7 @@ dashboard_routes = [
     Route("/api/fixed-server-toggle", api_fixed_server_toggle_handler, methods=["POST"]),
     Route("/api/dynamic-server-toggle", api_dynamic_server_toggle_handler, methods=["POST"]),
     Route("/api/webhooks", api_webhooks_handler),
+    Route("/api/tool-logs", api_tool_logs_handler),
     Route("/webhook/{token}", webhook_trigger_handler, methods=["POST"]),
     # OAuth 2.1 endpoints
     Route("/.well-known/oauth-protected-resource", oauth_protected_resource_handler),
@@ -4182,6 +4434,10 @@ async def invoke_internal_mcp_tool(tool: str, payload: str = "{}") -> str:
         return json.dumps({"error": f"Invalid MCP tool format '{normalized_tool}'"})
 
     server_name, tool_name = parts[1], parts[2]
+    start_time = time.time()
+    log_result = None
+    log_error = None
+    log_status = "success"
 
     enabled_servers = _get_mcp_servers_setting()
     if not any(s.get("name") == server_name for s in enabled_servers):
@@ -4232,21 +4488,44 @@ async def invoke_internal_mcp_tool(tool: str, payload: str = "{}") -> str:
     try:
         tool_func, error = _load_mcp_tool_from_file(server_name, server_path, tool_name)
         if error:
+            log_error = error
+            log_status = "error"
             return json.dumps({"error": error})
 
         result = tool_func(*args, **kwargs)
         if inspect.isawaitable(result):
             result = await result
+        log_result = result
     except TypeError as e:
-        return json.dumps({"error": f"Tool invocation failed: {e}"})
+        log_error = f"Tool invocation failed: {e}"
+        log_status = "error"
+        return json.dumps({"error": log_error})
     except Exception as e:
-        return json.dumps({"error": f"Tool execution error: {e}"})
+        log_error = f"Tool execution error: {e}"
+        log_status = "error"
+        return json.dumps({"error": log_error})
     finally:
         for key, prev in previous_env.items():
             if prev is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = prev
+
+        # Log tool invocation to database
+        duration_ms = (time.time() - start_time) * 1000
+        try:
+            result_str = json.dumps(log_result, default=str) if log_result is not None else None
+            if result_str and len(result_str) > 10240:
+                result_str = result_str[:10240] + "... (truncated)"
+            conn = get_db()
+            conn.execute(
+                "INSERT INTO tool_logs (id, server_name, tool_name, payload, result, error, status, duration_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(uuid.uuid4()), server_name, tool_name, payload, result_str, log_error, log_status, round(duration_ms, 2), datetime.now(timezone.utc).isoformat())
+            )
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
     response = {"success": True, "tool": normalized_tool, "result": result}
     if warning:
@@ -4888,8 +5167,8 @@ def main():
 
         base_app = mcp.http_app(path='/sse')  # Serve MCP at /sse for Claude connector
         base_app.routes.extend(dashboard_routes)
-        # Wrap with OAuth middleware to protect /sse endpoint
-        app = OAuthMiddleware(base_app)
+        # Wrap with OAuth middleware to protect /sse endpoint, then add CORS
+        app = CORSMiddleware(OAuthMiddleware(base_app))
 
         def run_sse_server():
             """Run SSE server in its own event loop"""
@@ -4962,8 +5241,8 @@ def main():
 
         base_app = mcp.http_app(path='/sse')  # Serve MCP at /sse for Claude connector
         base_app.routes.extend(dashboard_routes)
-        # Wrap with OAuth middleware to protect /sse endpoint
-        app = OAuthMiddleware(base_app)
+        # Wrap with OAuth middleware to protect /sse endpoint, then add CORS
+        app = CORSMiddleware(OAuthMiddleware(base_app))
 
         dashboard_url = "http://localhost:8080/"
         print(f"Dashboard available at {dashboard_url}", file=sys.stderr)
