@@ -1241,6 +1241,20 @@ DASHBOARD_HTML = """
                     </table>
                 </div>
             </div>
+            <div class="card" style="margin-top: var(--spacing-lg);">
+                <h2>Webhook Run History</h2>
+                <p style="color: var(--text-secondary); margin-bottom: var(--spacing-md); font-size: 13px;">
+                    Runs triggered by incoming webhook HTTP POST requests.
+                </p>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr><th>ID</th><th>Webhook</th><th>Started</th><th>Duration</th><th>Tokens</th><th>Cost</th><th>State</th><th>Output</th></tr>
+                        </thead>
+                        <tbody id="webhook-runs-table"></tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
         <div id="tool-logs" class="section">
@@ -1481,6 +1495,31 @@ DASHBOARD_HTML = """
             document.getElementById('output-modal').classList.add('active');
         }
 
+        function showWebhookRuns(webhookId) {
+            // Switch to webhooks tab if not already there
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+            const webhooksNav = document.querySelector('.nav-item[onclick*="webhooks"]');
+            if (webhooksNav) webhooksNav.classList.add('active');
+            document.getElementById('webhooks').classList.add('active');
+
+            // Scroll to the webhook run history table
+            const table = document.getElementById('webhook-runs-table');
+            if (table) {
+                table.closest('.card').scrollIntoView({ behavior: 'smooth', block: 'start' });
+            }
+
+            // Highlight matching rows briefly
+            const rows = table ? table.querySelectorAll('tr[data-webhook-id]') : [];
+            rows.forEach(row => {
+                row.style.transition = 'background-color 0.3s';
+                if (row.getAttribute('data-webhook-id') === webhookId) {
+                    row.style.backgroundColor = 'rgba(59, 130, 246, 0.15)';
+                    setTimeout(() => { row.style.backgroundColor = ''; }, 2000);
+                }
+            });
+        }
+
         function renderMarkdown(text) {
             if (!text) return '';
             try {
@@ -1629,6 +1668,7 @@ DASHBOARD_HTML = """
 
         function renderRunModal(run) {
             const job = jobsData.find(j => j.id === run.job_id);
+            const webhook = run.webhook_id ? webhooksData.find(w => w.id === run.webhook_id) : null;
             const parsed = parseOutput(run.output);
             const isLive = run.state === 'running' || run.state === 'pending';
 
@@ -1708,6 +1748,10 @@ DASHBOARD_HTML = """
                             <label>Cost</label>
                             <span style="color: ${cost > 0 ? '#28a745' : 'inherit'}; font-weight: ${cost > 0 ? '600' : 'inherit'};">${cost > 0 ? '$' + cost.toFixed(4) : '-'}</span>
                         </div>
+                        ${webhook ? `<div class="meta-item">
+                            <label>Webhook</label>
+                            <span>${escapeHtml(webhook.name)}</span>
+                        </div>` : ''}
                     </div>
                 </div>
                 <div class="modal-section">
@@ -1934,6 +1978,34 @@ DASHBOARD_HTML = """
                 </tr>
             `}).join('');
 
+            // Render webhook runs in table (follows same escapeHtml pattern as scheduled runs above)
+            document.getElementById('webhook-runs-table').innerHTML = webhookRuns.length === 0
+                ? '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: var(--spacing-lg);">No webhook-triggered runs yet.</td></tr>'
+                : webhookRuns.map(r => {
+                const job = jobsData.find(j => j.id === r.job_id);
+                const webhook = webhooksData.find(w => w.id === r.webhook_id);
+                const webhookName = webhook ? webhook.name : (job ? job.name : r.webhook_id ? r.webhook_id.substring(0, 8) : 'Unknown');
+                const summary = getResultSummary(r.output, r.error);
+                const tokens = r.total_tokens || 0;
+                const cost = r.cost_usd || 0;
+                const isRunning = r.state === 'running' || r.state === 'pending';
+                return `
+                <tr data-webhook-id="${r.webhook_id || ''}">
+                    <td><code style="color: var(--accent-cyan);">${r.id.substring(0, 8)}</code></td>
+                    <td>${escapeHtml(webhookName)}</td>
+                    <td style="color: var(--text-secondary);">${new Date(r.started_at).toLocaleString()}</td>
+                    <td>${formatDuration(r.started_at, r.finished_at)}</td>
+                    <td>${tokens > 0 ? tokens.toLocaleString() : '-'}</td>
+                    <td>${cost > 0 ? '$' + cost.toFixed(4) : '-'}</td>
+                    <td><span class="status ${r.state}">${isRunning ? '<span class="live-dot"></span>' : ''}${r.state}</span></td>
+                    <td>
+                        <div class="output-summary">${escapeHtml(summary.text)}</div>
+                        <button class="view-btn" onclick="event.stopPropagation(); showRunDetails('${r.id}')">View</button>
+                        ${isRunning ? `<button class="delete-btn" style="margin-left: 5px;" onclick="event.stopPropagation(); killRun('${r.id}')">Kill</button>` : ''}
+                    </td>
+                </tr>
+            `}).join('');
+
             // Render webhooks
             document.getElementById('webhooks-table').innerHTML = webhooksRes.length === 0
                 ? '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: var(--spacing-lg);">No webhooks configured. Create one using the MCP tool.</td></tr>'
@@ -1952,6 +2024,7 @@ DASHBOARD_HTML = """
                     <td><span class="status ${w.enabled ? 'enabled' : 'disabled'}">${w.enabled ? 'Active' : 'Disabled'}</span></td>
                     <td>
                         <button class="view-btn" onclick="viewWebhookPrompt('${w.id}')">View Prompt</button>
+                        <button class="view-btn" style="margin-left: 5px;" onclick="showWebhookRuns('${w.id}')">View Runs</button>
                     </td>
                 </tr>
             `).join('');
@@ -2957,60 +3030,66 @@ async def webhook_trigger_handler(request):
     token = request.path_params.get("token")
 
     conn = get_db()
-    webhook = conn.execute("SELECT * FROM webhooks WHERE secret_token = ?", (token,)).fetchone()
-
-    if not webhook:
-        conn.close()
-        return JSONResponse({"error": "Webhook not found"}, status_code=404)
-
-    if not webhook["enabled"]:
-        conn.close()
-        return JSONResponse({"error": "Webhook is disabled"}, status_code=403)
-
-    # Parse JSON payload
     try:
-        payload = await request.json()
-    except:
-        payload = {}
+        webhook = conn.execute("SELECT * FROM webhooks WHERE secret_token = ?", (token,)).fetchone()
 
-    # Render the prompt template with payload data
-    prompt = render_webhook_template(webhook["prompt_template"], payload)
+        if not webhook:
+            return JSONResponse({"error": "Webhook not found"}, status_code=404)
 
-    # Create a disabled job for this webhook run (follows quick-run pattern)
-    job_id = str(uuid.uuid4())[:8]
-    now = utc_now_iso()
+        if not webhook["enabled"]:
+            return JSONResponse({"error": "Webhook is disabled"}, status_code=403)
 
-    conn.execute("""
-        INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (job_id, f"Webhook: {webhook['name']} ({now[:16]})", "webhook", prompt, "claude", "[]", "{}", 0, now, now))
-    conn.commit()
+        print(f"[webhook] Trigger received for '{webhook['name']}' (id={webhook['id']})", file=sys.stderr)
 
-    # Create the run with webhook_id
-    run_id = str(uuid.uuid4())[:8]
-    conn.execute("""
-        INSERT INTO runs (id, job_id, started_at, prompt, command, state, webhook_id)
-        VALUES (?, ?, ?, ?, ?, 'pending', ?)
-    """, (run_id, job_id, now, prompt, "claude", webhook["id"]))
-    conn.commit()
+        # Parse JSON payload
+        try:
+            payload = await request.json()
+        except:
+            payload = {}
 
-    # Update webhook stats
-    conn.execute("""
-        UPDATE webhooks SET
-            last_triggered_at = ?,
-            trigger_count = trigger_count + 1
-        WHERE id = ?
-    """, (now, webhook["id"]))
-    conn.commit()
-    conn.close()
+        # Render the prompt template with payload data
+        prompt = render_webhook_template(webhook["prompt_template"], payload)
 
-    # Run will be picked up by run_processor_loop (within 5 seconds)
-    return JSONResponse({
-        "success": True,
-        "run_id": run_id,
-        "webhook_id": webhook["id"],
-        "message": "Webhook triggered successfully"
-    })
+        # Create a disabled job for this webhook run (follows quick-run pattern)
+        job_id = str(uuid.uuid4())[:8]
+        now = utc_now_iso()
+
+        conn.execute("""
+            INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (job_id, f"Webhook: {webhook['name']} ({now[:16]})", "webhook", prompt, "claude", "[]", "{}", 0, now, now))
+
+        # Create the run with webhook_id
+        run_id = str(uuid.uuid4())[:8]
+        conn.execute("""
+            INSERT INTO runs (id, job_id, started_at, prompt, command, state, webhook_id)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        """, (run_id, job_id, now, prompt, "claude", webhook["id"]))
+
+        # Update webhook stats
+        conn.execute("""
+            UPDATE webhooks SET
+                last_triggered_at = ?,
+                trigger_count = trigger_count + 1
+            WHERE id = ?
+        """, (now, webhook["id"]))
+
+        conn.commit()
+
+        print(f"[webhook] Created run {run_id} for webhook '{webhook['name']}' (job_id={job_id})", file=sys.stderr)
+
+        # Run will be picked up by run_processor_loop (within 5 seconds)
+        return JSONResponse({
+            "success": True,
+            "run_id": run_id,
+            "webhook_id": webhook["id"],
+            "message": "Webhook triggered successfully"
+        })
+    except Exception as e:
+        print(f"[webhook] Error triggering webhook (token={token[:8]}...): {e}", file=sys.stderr)
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        conn.close()
 
 @require_auth
 async def api_delete_job_handler(request):
