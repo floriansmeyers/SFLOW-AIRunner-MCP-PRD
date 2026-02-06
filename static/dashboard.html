@@ -65,34 +65,44 @@
         </div>
 
         <div id="admin-chat" class="section active">
-            <div class="card">
-                <div class="chat-title-row">
-                    <div>
-                        <h2>Admin Chat</h2>
-                        <p style="color: var(--text-secondary); margin-bottom: 0; font-size: 13px;">Manage jobs, webhooks, servers, and credentials through natural language.</p>
+            <div class="admin-chat-layout">
+                <div class="chat-sidebar" id="chat-sidebar">
+                    <div class="chat-sidebar-header">
+                        <span class="chat-sidebar-title">History</span>
                     </div>
-                    <div class="chat-header-actions">
-                        <select id="chat-provider" class="chat-provider-select">
-                            <option value="claude">Claude</option>
-                        </select>
-                        <button class="chat-clear-btn" onclick="clearAdminChat()" title="New conversation">New Chat</button>
+                    <div class="chat-sidebar-list" id="chat-sidebar-list">
+                        <!-- Populated by loadConversationList() -->
                     </div>
                 </div>
-                <div class="chat-messages" id="chat-messages">
-                    <div class="chat-welcome">
-                        <h3>Welcome to Admin Chat</h3>
-                        <p>Try one of these to get started:</p>
-                        <div class="chat-suggestions">
-                            <button class="chat-suggestion" onclick="sendSuggestion('List all scheduled jobs')">List all scheduled jobs</button>
-                            <button class="chat-suggestion" onclick="sendSuggestion('Show me all webhooks')">Show me all webhooks</button>
-                            <button class="chat-suggestion" onclick="sendSuggestion('What MCP servers are available?')">What MCP servers are available?</button>
-                            <button class="chat-suggestion" onclick="sendSuggestion('Create a job that checks the weather every morning at 8am')">Create a morning weather job</button>
+                <div class="card chat-main">
+                    <div class="chat-title-row">
+                        <div>
+                            <h2>Admin Chat</h2>
+                            <p style="color: var(--text-secondary); margin-bottom: 0; font-size: 13px;">Manage jobs, webhooks, servers, and credentials through natural language.</p>
+                        </div>
+                        <div class="chat-header-actions">
+                            <select id="chat-provider" class="chat-provider-select">
+                                <option value="claude">Claude</option>
+                            </select>
+                            <button class="chat-clear-btn" onclick="clearAdminChat()" title="New conversation">New Chat</button>
                         </div>
                     </div>
-                </div>
-                <div class="chat-input-area">
-                    <input type="text" id="chat-input" class="chat-input" placeholder="Ask me to manage jobs, webhooks, servers..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAdminMessage()}">
-                    <button class="chat-send-btn" id="chat-send-btn" onclick="sendAdminMessage()">Send</button>
+                    <div class="chat-messages" id="chat-messages">
+                        <div class="chat-welcome">
+                            <h3>Welcome to Admin Chat</h3>
+                            <p>Try one of these to get started:</p>
+                            <div class="chat-suggestions">
+                                <button class="chat-suggestion" onclick="sendSuggestion('List all scheduled jobs')">List all scheduled jobs</button>
+                                <button class="chat-suggestion" onclick="sendSuggestion('Show me all webhooks')">Show me all webhooks</button>
+                                <button class="chat-suggestion" onclick="sendSuggestion('What MCP servers are available?')">What MCP servers are available?</button>
+                                <button class="chat-suggestion" onclick="sendSuggestion('Create a job that checks the weather every morning at 8am')">Create a morning weather job</button>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="chat-input-area">
+                        <input type="text" id="chat-input" class="chat-input" placeholder="Ask me to manage jobs, webhooks, servers..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAdminMessage()}">
+                        <button class="chat-send-btn" id="chat-send-btn" onclick="sendAdminMessage()">Send</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -334,25 +344,35 @@
         // ADMIN CHAT
         // ========================================
         const ADMIN_CHAT_STORAGE_KEY = 'spinner_admin_chat';
+        const ADMIN_CHAT_ID_KEY = 'spinner_admin_chat_id';
         let adminMessages = [];
         let adminChatBusy = false;
+        let currentConversationId = null;
 
         function loadAdminChatHistory() {
             try {
                 const stored = localStorage.getItem(ADMIN_CHAT_STORAGE_KEY);
+                const storedId = localStorage.getItem(ADMIN_CHAT_ID_KEY);
                 if (stored) {
                     adminMessages = JSON.parse(stored);
+                    currentConversationId = storedId || null;
                     renderAdminChat();
                 }
             } catch (e) {
                 console.error('Failed to load chat history:', e);
                 adminMessages = [];
             }
+            loadConversationList();
         }
 
         function saveAdminChatHistory() {
             try {
                 localStorage.setItem(ADMIN_CHAT_STORAGE_KEY, JSON.stringify(adminMessages));
+                if (currentConversationId) {
+                    localStorage.setItem(ADMIN_CHAT_ID_KEY, currentConversationId);
+                } else {
+                    localStorage.removeItem(ADMIN_CHAT_ID_KEY);
+                }
             } catch (e) {
                 console.error('Failed to save chat history:', e);
             }
@@ -360,6 +380,7 @@
 
         function clearAdminChat() {
             adminMessages = [];
+            currentConversationId = null;
             saveAdminChatHistory();
             const container = document.getElementById('chat-messages');
             while (container.firstChild) container.removeChild(container.firstChild);
@@ -388,6 +409,8 @@
             });
             welcome.appendChild(sugDiv);
             container.appendChild(welcome);
+            // Update sidebar to deselect active item
+            highlightActiveConversation();
         }
 
         function sendSuggestion(text) {
@@ -428,10 +451,12 @@
 
             try {
                 const command = document.getElementById('chat-provider').value;
+                const payload = { messages: adminMessages, command };
+                if (currentConversationId) payload.conversation_id = currentConversationId;
                 const res = await fetch('/api/admin-chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ messages: adminMessages, command }),
+                    body: JSON.stringify(payload),
                 });
                 const data = await res.json();
 
@@ -445,8 +470,10 @@
 
                 // Update messages from server response (includes tool call round-trips)
                 adminMessages = data.messages || adminMessages;
+                if (data.conversation_id) currentConversationId = data.conversation_id;
                 saveAdminChatHistory();
                 renderAdminChat(data.tool_calls_made || []);
+                loadConversationList();
             } catch (e) {
                 showToast('Chat error: ' + e.message, 'error');
             } finally {
@@ -577,6 +604,123 @@
 
         loadChatProviders();
         loadAdminChatHistory();
+
+        function loadConversationList() {
+            fetch('/api/admin-chats').then(r => r.json()).then(data => {
+                if (!data.chats) return;
+                renderConversationSidebar(data.chats);
+            }).catch(e => console.error('Failed to load conversation list:', e));
+        }
+
+        function renderConversationSidebar(chats) {
+            const list = document.getElementById('chat-sidebar-list');
+            while (list.firstChild) list.removeChild(list.firstChild);
+
+            if (chats.length === 0) {
+                const empty = document.createElement('div');
+                empty.className = 'chat-sidebar-empty';
+                empty.textContent = 'No conversations yet';
+                list.appendChild(empty);
+                return;
+            }
+
+            for (const chat of chats) {
+                const item = document.createElement('div');
+                item.className = 'chat-history-item';
+                if (chat.id === currentConversationId) item.classList.add('active');
+                item.onclick = (e) => {
+                    if (e.target.closest('.chat-history-delete')) return;
+                    loadConversation(chat.id);
+                };
+
+                const title = document.createElement('div');
+                title.className = 'chat-history-title';
+                title.textContent = chat.title;
+                item.appendChild(title);
+
+                const meta = document.createElement('div');
+                meta.className = 'chat-history-meta';
+                const timeStr = formatRelativeTime(chat.updated_at);
+                const parts = [timeStr];
+                if (chat.provider && chat.provider !== 'claude') parts.push(chat.provider);
+                if (chat.tool_calls_count > 0) parts.push(chat.tool_calls_count + ' tools');
+                meta.textContent = parts.join(' \u00b7 ');
+                item.appendChild(meta);
+
+                const delBtn = document.createElement('button');
+                delBtn.className = 'chat-history-delete';
+                delBtn.textContent = '\u00d7';
+                delBtn.title = 'Delete conversation';
+                delBtn.onclick = (e) => {
+                    e.stopPropagation();
+                    deleteConversation(chat.id);
+                };
+                item.appendChild(delBtn);
+
+                list.appendChild(item);
+            }
+        }
+
+        function highlightActiveConversation() {
+            const items = document.querySelectorAll('.chat-history-item');
+            items.forEach(item => item.classList.remove('active'));
+            if (currentConversationId) {
+                // re-highlight after render
+                items.forEach(item => {
+                    // Match by checking if onclick loads this ID
+                    // Simpler: just reload the sidebar
+                });
+            }
+            // Easiest: just re-render
+            loadConversationList();
+        }
+
+        function loadConversation(chatId) {
+            fetch('/api/admin-chat/' + chatId).then(r => r.json()).then(data => {
+                if (data.error) {
+                    showToast('Failed to load conversation: ' + data.error, 'error');
+                    return;
+                }
+                adminMessages = data.messages || [];
+                currentConversationId = data.id;
+                saveAdminChatHistory();
+                renderAdminChat();
+                // Update provider dropdown to match conversation
+                if (data.provider) {
+                    const sel = document.getElementById('chat-provider');
+                    if (sel) sel.value = data.provider;
+                }
+                loadConversationList();
+            }).catch(e => showToast('Failed to load conversation: ' + e.message, 'error'));
+        }
+
+        function deleteConversation(chatId) {
+            fetch('/api/admin-chat/' + chatId, { method: 'DELETE' }).then(r => r.json()).then(data => {
+                if (data.error) {
+                    showToast('Failed to delete: ' + data.error, 'error');
+                    return;
+                }
+                if (chatId === currentConversationId) {
+                    clearAdminChat();
+                }
+                loadConversationList();
+            }).catch(e => showToast('Failed to delete: ' + e.message, 'error'));
+        }
+
+        function formatRelativeTime(isoStr) {
+            if (!isoStr) return '';
+            const date = new Date(isoStr.endsWith('Z') ? isoStr : isoStr + 'Z');
+            const now = new Date();
+            const diffMs = now - date;
+            const diffMin = Math.floor(diffMs / 60000);
+            if (diffMin < 1) return 'just now';
+            if (diffMin < 60) return diffMin + 'm ago';
+            const diffHr = Math.floor(diffMin / 60);
+            if (diffHr < 24) return diffHr + 'h ago';
+            const diffDay = Math.floor(diffHr / 24);
+            if (diffDay < 7) return diffDay + 'd ago';
+            return date.toLocaleDateString();
+        }
 
         function copyToClipboard(text) {
             navigator.clipboard.writeText(text).then(() => {

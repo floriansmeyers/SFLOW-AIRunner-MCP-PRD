@@ -100,6 +100,7 @@ SQLite at `./jobs.db` with tables:
 - `runs` - Execution history with output, tokens, cost, state (pending/running/finished/error)
 - `webhooks` - HTTP endpoints that trigger prompts with payload templating
 - `settings` - Configuration for allowed tools, MCP servers, credentials, `default_provider`
+- `admin_chats` - Persisted admin chat conversations with full message history (Anthropic format JSON), title, provider, tool call count, timestamps
 
 ## MCP Tools
 
@@ -170,11 +171,12 @@ The dashboard HTML lives in `static/dashboard.html` and is loaded once at import
 
 The Admin Chat enables system configuration through natural language, calling Spinner's MCP tools directly:
 
-- **Backend**: `POST /api/admin-chat` endpoint receives `{messages, command}` (Anthropic messages format)
+- **Backend**: `POST /api/admin-chat` endpoint receives `{messages, command, conversation_id}` (Anthropic messages format)
+- **Persistence**: Conversations saved to `admin_chats` table. New conversations get auto-generated ID and title (from first user message). Existing conversations updated on each message. Response includes `conversation_id`.
 - **Tool registry**: `ADMIN_TOOLS` dict maps tool names to callables; `ADMIN_TOOL_DEFINITIONS` built lazily via `_build_admin_tool_definitions()` using `_extract_tool_schema()`
 - **Provider-agnostic**: Uses `provider.chat()` method — works with Claude (Anthropic API), OpenAI, and Ollama
 - **MCP server tools**: `create_mcp_server`, `update_mcp_server`, `delete_mcp_server`, `get_dynamic_mcp_server` are included — the AI can create/modify dynamic MCP servers via natural language
-- **Frontend**: Chat history persisted in localStorage; tool calls shown as collapsible `<details>`
+- **Frontend**: Chat history persisted in localStorage (for fast reload) and server-side in `admin_chats` table (for auditability). Sidebar shows conversation history loaded from server. Tool calls shown as collapsible `<details>`
 
 ### Scheduler Fixed Server
 
@@ -187,7 +189,10 @@ The Admin Chat enables system configuration through natural language, calling Sp
 
 - `GET /api/providers` - Returns available providers with capabilities and default
 - `POST /api/run-prompt` - Accepts `{prompt, command}` where `command` is the provider name
-- `POST /api/admin-chat` - Admin chat with tool calling. Accepts `{messages, command}`, returns `{messages, response_text, tool_calls_made}`
+- `POST /api/admin-chat` - Admin chat with tool calling. Accepts `{messages, command, conversation_id}`, returns `{messages, response_text, tool_calls_made, conversation_id}`
+- `GET /api/admin-chats` - List admin chat conversations (metadata only, no messages). ORDER BY updated_at DESC LIMIT 100
+- `GET /api/admin-chat/{chat_id}` - Load a single conversation with full messages
+- `DELETE /api/admin-chat/{chat_id}` - Delete a conversation
 
 ## Key Dependencies
 

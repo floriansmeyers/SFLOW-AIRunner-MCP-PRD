@@ -487,6 +487,17 @@ def init_db():
         );
         CREATE INDEX IF NOT EXISTS idx_tool_logs_created ON tool_logs(created_at);
 
+        CREATE TABLE IF NOT EXISTS admin_chats (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL DEFAULT 'New Conversation',
+            provider TEXT NOT NULL DEFAULT 'claude',
+            messages TEXT NOT NULL DEFAULT '[]',
+            tool_calls_count INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_admin_chats_updated ON admin_chats(updated_at);
+
         -- OAuth 2.1 tables for MCP authentication
         CREATE TABLE IF NOT EXISTS oauth_clients (
             client_id TEXT PRIMARY KEY,
@@ -1390,6 +1401,7 @@ async def api_admin_chat_handler(request):
         body = await request.json()
         messages = body.get("messages", [])
         command = body.get("command", _get_default_provider())
+        conversation_id = body.get("conversation_id")
 
         if not messages:
             return JSONResponse({"error": "No messages provided"}, status_code=400)
@@ -1414,11 +1426,94 @@ async def api_admin_chat_handler(request):
             tool_defs=ADMIN_TOOL_DEFINITIONS,
             tool_callables=ADMIN_TOOL_CALLABLES,
         )
+
+        # Persist conversation to database
+        now = utc_now_iso()
+        result_messages = result.get("messages", messages)
+        tool_calls_made = result.get("tool_calls_made", [])
+        messages_json = json.dumps(result_messages)
+
+        conn = get_db()
+        try:
+            if conversation_id:
+                # Update existing conversation
+                conn.execute(
+                    """UPDATE admin_chats
+                       SET messages = ?, updated_at = ?,
+                           tool_calls_count = tool_calls_count + ?
+                       WHERE id = ?""",
+                    (messages_json, now, len(tool_calls_made), conversation_id),
+                )
+                conn.commit()
+            else:
+                # Create new conversation
+                conversation_id = str(uuid.uuid4())
+                # Extract title from first user message
+                title = "New Conversation"
+                for msg in messages:
+                    if msg.get("role") == "user":
+                        content = msg.get("content", "")
+                        if isinstance(content, str) and content.strip():
+                            title = content.strip()[:80]
+                            break
+                conn.execute(
+                    """INSERT INTO admin_chats (id, title, provider, messages, tool_calls_count, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (conversation_id, title, command, messages_json, len(tool_calls_made), now, now),
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
+        result["conversation_id"] = conversation_id
         return JSONResponse(result)
     except Exception as e:
         import traceback
         traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
+
+@require_auth
+async def api_admin_chats_list_handler(request):
+    """List admin chat conversations (metadata only, no messages)"""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """SELECT id, title, provider, tool_calls_count, created_at, updated_at
+               FROM admin_chats ORDER BY updated_at DESC LIMIT 100"""
+        ).fetchall()
+        chats = [dict(r) for r in rows]
+        return JSONResponse({"chats": chats})
+    finally:
+        conn.close()
+
+@require_auth
+async def api_admin_chat_detail_handler(request):
+    """Load a single admin chat conversation with full messages"""
+    chat_id = request.path_params["chat_id"]
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT * FROM admin_chats WHERE id = ?", (chat_id,)).fetchone()
+        if not row:
+            return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        chat = dict(row)
+        chat["messages"] = json.loads(chat["messages"])
+        return JSONResponse(chat)
+    finally:
+        conn.close()
+
+@require_auth
+async def api_admin_chat_delete_handler(request):
+    """Delete an admin chat conversation"""
+    chat_id = request.path_params["chat_id"]
+    conn = get_db()
+    try:
+        result = conn.execute("DELETE FROM admin_chats WHERE id = ?", (chat_id,))
+        conn.commit()
+        if result.rowcount == 0:
+            return JSONResponse({"error": "Conversation not found"}, status_code=404)
+        return JSONResponse({"ok": True})
+    finally:
+        conn.close()
 
 @require_auth
 async def api_stats_handler(request):
@@ -2358,6 +2453,9 @@ dashboard_routes = [
     Route("/api/run/{run_id}/kill", api_kill_run_handler, methods=["POST"]),
     Route("/api/run-prompt", api_run_prompt_handler, methods=["POST"]),
     Route("/api/admin-chat", api_admin_chat_handler, methods=["POST"]),
+    Route("/api/admin-chats", api_admin_chats_list_handler, methods=["GET"]),
+    Route("/api/admin-chat/{chat_id}", api_admin_chat_detail_handler, methods=["GET"]),
+    Route("/api/admin-chat/{chat_id}", api_admin_chat_delete_handler, methods=["DELETE"]),
     Route("/api/job/{job_id}", api_get_job_handler, methods=["GET"]),
     Route("/api/job/{job_id}", api_update_job_handler, methods=["PUT"]),
     Route("/api/job/{job_id}", api_delete_job_handler, methods=["DELETE"]),
