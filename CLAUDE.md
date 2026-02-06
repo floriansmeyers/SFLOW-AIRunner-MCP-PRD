@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Single-file MCP server that schedules and executes Claude Code CLI tasks via cron expressions. Built with FastMCP and stores jobs/runs in SQLite. Features a web dashboard, webhook support, dynamic MCP server creation, and token/cost tracking.
+Single-file MCP server that schedules and executes AI tasks via multiple providers (Claude, OpenAI, Ollama) with cron expressions. Built with FastMCP and stores jobs/runs in SQLite. Features a web dashboard, webhook support, dynamic MCP server creation, and token/cost tracking.
 
 ## Commands
 
@@ -36,7 +36,35 @@ The server runs three concurrent async components in separate threads:
 2. **Scheduler Loop** - Checks every 60 seconds for jobs due based on cron expressions
 3. **Run Processor Loop** - Picks up pending runs and executes them (handles restarts gracefully)
 
-Jobs execute via `claude_agent_sdk` using the `sdk_query()` streaming API. Token usage and costs are parsed from the SDK response.
+### Provider Architecture
+
+Jobs execute via a **provider abstraction layer**. The `command` field on jobs/runs selects the provider:
+
+| Provider | `command` value | Execution method | MCP tool support |
+|----------|----------------|------------------|-----------------|
+| **ClaudeProvider** | `"claude"` | Claude Agent SDK (`sdk_query()` streaming) | Native MCP via CLI |
+| **OpenAIProvider** | `"openai"` | OpenAI Chat Completions API with function calling | MCP tools converted to OpenAI functions |
+| **OllamaProvider** | `"ollama"` | Ollama HTTP API (`/api/chat`) | MCP tools converted to OpenAI-compatible functions |
+
+**Key classes:**
+- `BaseProvider` (ABC) - Abstract interface with `execute()`, `get_pricing()`, `is_available()`, `get_capabilities()`
+- `ProviderResult` (dataclass) - Standardized result with `output_parts`, tokens, cost, model info
+- `PROVIDERS` (dict) - Registry populated at startup by `init_providers()`
+- `_get_default_provider()` - Returns default provider (DB setting `default_provider`, then first available)
+
+**MCP-to-function-calling conversion** (used by OpenAI and Ollama providers):
+- `_extract_tool_schema(func)` - Builds JSON Schema from `inspect.signature()`
+- `_convert_mcp_tools_to_functions(mcp_config)` - Discovers tools via `_discover_python_mcp_tools()`, loads via `_load_mcp_tool_from_file()`, converts to OpenAI function format. Temporarily injects each server's `config['env']` vars into `os.environ` before loading so that in-process module imports see credentials, then restores the original env afterwards.
+- Tool execution in agentic loop: parse arguments from provider response, call MCP tool callable, return result
+
+### Environment Variables for Providers
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `OPENAI_API_KEY` | (required for OpenAI) | OpenAI API key |
+| `OPENAI_MODEL` | `gpt-4o` | OpenAI model to use |
+| `OLLAMA_URL` | `http://localhost:11434` | Local server URL (Ollama, LM Studio, etc.) |
+| `OLLAMA_MODEL` | `llama3.1` | Local model to use (e.g. `openai/gpt-oss-20b` for LM Studio) |
 
 ## Directory Structure
 
@@ -56,10 +84,10 @@ Jobs execute via `claude_agent_sdk` using the `sdk_query()` streaming API. Token
 ## Database
 
 SQLite at `./jobs.db` with tables:
-- `jobs` - Scheduled tasks with cron expressions, prompts, timeout settings
+- `jobs` - Scheduled tasks with cron expressions, prompts, timeout settings. The `command` field selects the AI provider (`"claude"`, `"openai"`, `"ollama"`)
 - `runs` - Execution history with output, tokens, cost, state (pending/running/finished/error)
 - `webhooks` - HTTP endpoints that trigger prompts with payload templating
-- `settings` - Configuration for allowed tools, MCP servers, credentials
+- `settings` - Configuration for allowed tools, MCP servers, credentials, `default_provider`
 
 ## MCP Tools
 
@@ -116,16 +144,23 @@ When creating dynamic servers with `create_mcp_server`, env vars can be auto-det
 ## Web Dashboard (SSE mode only)
 
 - Cost overview (today/week/total)
-- Quick run for ad-hoc prompts
+- Quick run for ad-hoc prompts with provider selection dropdown
 - Job/run/webhook management
 - Fixed and dynamic MCP server management
 - Credential configuration per server
 - Live run output streaming
+- Provider/model shown on run cards
+
+### Dashboard API Endpoints
+
+- `GET /api/providers` - Returns available providers with capabilities and default
+- `POST /api/run-prompt` - Accepts `{prompt, command}` where `command` is the provider name
 
 ## Key Dependencies
 
 - `fastmcp` - MCP protocol implementation
-- `claude-agent-sdk` - Core execution engine for running jobs
+- `claude-agent-sdk` - Claude provider execution engine
+- `openai` - OpenAI provider (optional, gracefully skipped if not installed)
 - `croniter` - Cron expression parsing
 - `sendgrid`, `requests` - Email provider integrations
 - `uvicorn` - ASGI server for SSE transport

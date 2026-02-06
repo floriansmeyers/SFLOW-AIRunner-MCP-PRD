@@ -1,18 +1,24 @@
 # Claude Runner - MCP Server with Job Scheduling
 
-A single-file MCP server that schedules and executes Claude Code CLI tasks via cron expressions. Features a web dashboard, webhook support, dynamic MCP server creation, and token/cost tracking.
+A single-file MCP server that schedules and executes AI tasks via cron expressions. Supports multiple AI providers — **Claude** (Agent SDK), **OpenAI**, and **Ollama/LM Studio** (any OpenAI-compatible local server). Features a web dashboard, webhook support, dynamic MCP server creation, and token/cost tracking.
 
 ![Dashboard](docs/dashboard.png)
 
 ## Prerequisites
 
 - **Python 3.11+** (required for `asyncio.timeout()`)
-- **Claude Agent SDK** (`pip install claude-agent-sdk`)
 - **SQLite3** (usually pre-installed on macOS/Linux)
-- **Anthropic API key** - Jobs are executed via the Claude Agent SDK, which requires an `ANTHROPIC_API_KEY`. **Do not rely on a personal Max/Pro subscription** — the SDK needs an API key from [console.anthropic.com](https://console.anthropic.com/). Set it in your environment or `.env` file:
-  ```bash
-  export ANTHROPIC_API_KEY=sk-ant-...
-  ```
+- **At least one AI provider configured** (see below)
+
+### Provider Setup
+
+| Provider | Required Package | Required Env Var | Description |
+|----------|-----------------|------------------|-------------|
+| **Claude** | `claude-agent-sdk` | `ANTHROPIC_API_KEY` | Anthropic Claude via Agent SDK. API key from [console.anthropic.com](https://console.anthropic.com/) — do not use a personal Max/Pro subscription. |
+| **OpenAI** | `openai` | `OPENAI_API_KEY` | OpenAI GPT models via the OpenAI API. |
+| **Ollama** | `openai` | `OLLAMA_URL` | Any OpenAI-compatible local server (Ollama, LM Studio, vLLM, etc.). No API key needed for local inference. |
+
+Providers are auto-detected at startup. Only providers with their package installed and required env vars set will be registered. The server works with any combination — you don't need all three.
 
 ## Quick Start
 
@@ -77,9 +83,20 @@ MCP_TRANSPORT=both python server.py
 
 ## Environment Variables
 
+### Provider Configuration
+
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | **Yes** | - | API key from [console.anthropic.com](https://console.anthropic.com/) — required for job execution via the Claude Agent SDK. Do not use a personal Max/Pro subscription. |
+| `ANTHROPIC_API_KEY` | For Claude | - | API key from [console.anthropic.com](https://console.anthropic.com/) |
+| `OPENAI_API_KEY` | For OpenAI | - | OpenAI API key |
+| `OPENAI_MODEL` | No | `gpt-4o` | OpenAI model to use (e.g., `gpt-4o`, `gpt-4o-mini`, `o3`, `o4-mini`) |
+| `OLLAMA_URL` | For Ollama | `http://localhost:11434` | URL of the OpenAI-compatible server (Ollama, LM Studio, vLLM, etc.) — `/v1` is appended automatically |
+| `OLLAMA_MODEL` | No | `llama3.1` | Model to use on the local server |
+
+### Server Configuration
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
 | `MCP_TRANSPORT` | No | `both` | Transport mode: `stdio`, `sse`, or `both` |
 | `OAUTH_CLIENT_ID` | No | auto-generated | OAuth client ID |
 | `OAUTH_CLIENT_SECRET` | No | auto-generated | OAuth client secret |
@@ -92,7 +109,16 @@ MCP_TRANSPORT=both python server.py
 Create a `.env` file to persist these:
 
 ```env
+# Provider keys (configure at least one)
 ANTHROPIC_API_KEY=sk-ant-...
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o
+
+# Local server (Ollama, LM Studio, etc.)
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.1
+
+# Server config
 OAUTH_CLIENT_ID=your_client_id
 OAUTH_CLIENT_SECRET=your_client_secret
 OAUTH_SECRET_KEY=your_secret_key
@@ -270,7 +296,10 @@ python server.py  # Creates fresh database
 
 Once connected, you interact with the server entirely through natural language. Claude translates your requests into the appropriate MCP tool calls behind the scenes.
 
-**Important:** Jobs are executed via the Claude Agent SDK, which runs the local Claude Code CLI under the hood. You need [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude` must be available on the system PATH and logged in) on the machine running the server.
+**Note on providers:**
+- **Claude** provider requires the Claude Agent SDK, which runs the local Claude Code CLI. You need [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated (`claude` on the system PATH) on the machine running the server.
+- **OpenAI** provider requires an `OPENAI_API_KEY` env var.
+- **Ollama** provider works with any OpenAI-compatible local server (Ollama, LM Studio, vLLM, etc.) — set `OLLAMA_URL` to point to your server.
 
 Below are the main workflows.
 
@@ -295,15 +324,17 @@ Claude: [calls set_server_credential("weather", "OPENWEATHERMAP_API_KEY", "abc12
 
 ### Scheduling Recurring Jobs
 
-Jobs run on cron schedules using the Claude Agent SDK. You can specify which tools the job is allowed to use (empty array `[]` means all tools).
+Jobs run on cron schedules. You can specify which provider to use via the `command` field (`"claude"`, `"openai"`, or `"ollama"`) and which tools the job is allowed to use (empty array `[]` means all tools).
 
 ```
-You: Create a job that runs every weekday at 9am to summarize our Azure DevOps sprint
+You: Create a job that runs every weekday at 9am to summarize our Azure DevOps sprint,
+     using OpenAI
 
 Claude: [calls create_job with:]
   name: "Daily Sprint Summary"
   cron: "0 9 * * 1-5"
   prompt: "Connect to Azure DevOps and summarize the current sprint..."
+  command: "openai"
   tools: ["mcp__azure-devops__wit_my_work_items", "mcp__email__send_email"]
   Job created (id: a1b2c3d4). Next run: tomorrow at 9:00 AM.
 
@@ -315,15 +346,16 @@ Claude: [calls list_runs with limit=5]
 
 ### Setting Up Webhooks
 
-Webhooks let external services trigger a prompt via HTTP POST. The `prompt_template` supports `{{payload}}` for the full body or `{{payload.field.subfield}}` for nested values.
+Webhooks let external services trigger a prompt via HTTP POST. The `prompt_template` supports `{{payload}}` for the full body or `{{payload.field.subfield}}` for nested values. Each webhook can have its own `command` to select which provider processes it.
 
 ```
 You: Create a webhook that sends a Slack summary whenever a new Azure DevOps
-     work item is created. The POST body will have the item title at
-     resource.fields.System.Title.
+     work item is created, using the local Ollama model. The POST body will have
+     the item title at resource.fields.System.Title.
 
 Claude: [calls create_webhook with:]
   name: "New Work Item Notifier"
+  command: "ollama"
   prompt_template: "A new work item was created: {{payload.resource.fields.System.Title}}.
                     Summarize it and post to Slack."
   Webhook created! POST to this URL to trigger it:
@@ -374,7 +406,7 @@ Claude: [calls get_unconfigured_servers]
 
 ### Ad-hoc Prompts
 
-For one-off tasks, use the **Quick Run** feature in the web dashboard (SSE mode) to execute a prompt immediately without creating a job. From claude.ai, you can also manually trigger any existing job:
+For one-off tasks, use the **Quick Run** feature in the web dashboard (SSE mode) to execute a prompt immediately without creating a job. The Quick Run form includes a provider dropdown to select which AI model processes the prompt. From claude.ai, you can also manually trigger any existing job:
 
 ```
 You: Run the "Daily Sprint Summary" job right now
@@ -478,37 +510,69 @@ python -c "from playwright.sync_api import sync_playwright; p = sync_playwright(
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                       MCP Server                            │
-│  ┌───────────┐  ┌───────────────┐  ┌───────────────────┐   │
-│  │ Job CRUD  │  │   Scheduler   │  │   Run Processor   │   │
-│  │  Tools    │  │  (60s loop)   │  │     (async)       │   │
-│  └─────┬─────┘  └───────┬───────┘  └─────────┬─────────┘   │
-│        │                │                    │             │
-│        └────────────────┼────────────────────┘             │
-│                         ▼                                  │
-│                ┌────────────────┐                          │
-│                │    SQLite      │                          │
-│                │   (jobs.db)    │                          │
-│                └────────────────┘                          │
-│                         │                                  │
-│                         ▼                                  │
-│                ┌────────────────┐                          │
-│                │ Claude Agent   │                          │
-│                │     SDK        │                          │
-│                └────────────────┘                          │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                        MCP Server                            │
+│  ┌───────────┐  ┌───────────────┐  ┌───────────────────┐    │
+│  │ Job CRUD  │  │   Scheduler   │  │   Run Processor   │    │
+│  │  Tools    │  │  (60s loop)   │  │     (async)       │    │
+│  └─────┬─────┘  └───────┬───────┘  └─────────┬─────────┘    │
+│        │                │                     │              │
+│        └────────────────┼─────────────────────┘              │
+│                         ▼                                    │
+│                ┌────────────────┐                             │
+│                │    SQLite      │                             │
+│                │   (jobs.db)    │                             │
+│                └────────┬───────┘                             │
+│                         ▼                                    │
+│              ┌─────────────────────┐                         │
+│              │  Provider Registry  │                         │
+│              └──┬────────┬──────┬──┘                         │
+│                 ▼        ▼      ▼                            │
+│  ┌──────────┐ ┌────────┐ ┌───────────────┐                  │
+│  │  Claude   │ │ OpenAI │ │ Ollama/Local  │                  │
+│  │Agent SDK  │ │  API   │ │ (LM Studio,..)│                  │
+│  └──────────┘ └────────┘ └───────────────┘                  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 The server runs three concurrent async components:
 1. **MCP Server** - Exposes 25+ tools via FastMCP
 2. **Scheduler Loop** - Checks every 60 seconds for jobs due based on cron
-3. **Run Processor Loop** - Picks up pending runs and executes them
+3. **Run Processor Loop** - Picks up pending runs and dispatches to the selected provider
+
+### Provider System
+
+The `command` field on jobs, webhooks, and ad-hoc runs selects which AI provider processes the task. Providers are registered at startup based on available packages and env vars.
+
+| Provider | `command` value | MCP Tool Support | Cost Tracking |
+|----------|----------------|------------------|---------------|
+| Claude | `"claude"` | Native via Agent SDK | Full (input/output/cache tokens) |
+| OpenAI | `"openai"` | Converted to function calling | Full (input/output tokens) |
+| Ollama | `"ollama"` | Converted to function calling | Free (local inference) |
+
+MCP tools from enabled servers are automatically converted to each provider's native function-calling format. Server credentials (stored in the DB via `set_server_credential`) are injected into the environment during tool loading so that all providers — including OpenAI and Ollama which import modules in-process — can access them. The OpenAI and Ollama providers run an agentic tool loop (up to 20 iterations) to handle multi-step tool use.
+
+## REST API
+
+The server exposes a REST API (SSE mode) for external integrations:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/providers` | GET | List registered providers and their capabilities |
+| `/api/run` | POST | Execute an ad-hoc prompt (`{prompt, command?}`) |
+| `/api/jobs` | GET/POST | List or create jobs |
+| `/api/job/{id}` | GET/PUT/DELETE | Get, update, or delete a job |
+| `/api/job/{id}/trigger` | POST | Trigger a job run |
+| `/api/runs` | GET | List runs |
+| `/api/run/{id}` | GET | Get run details |
+| `/api/webhooks` | GET | List webhooks |
+| `/api/webhook/{id}/provider` | PUT | Update a webhook's provider |
 
 ## Key Dependencies
 
 - `fastmcp` - MCP protocol implementation
-- `claude-agent-sdk` - Core execution engine for running jobs
+- `claude-agent-sdk` - Claude provider execution engine
+- `openai` - OpenAI and Ollama/local provider execution (optional)
 - `croniter` - Cron expression parsing
 - `sendgrid`, `requests` - Email provider integrations
 - `uvicorn` - ASGI server for SSE transport

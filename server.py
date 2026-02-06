@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Claude Code Runner - MCP Server with Job Scheduling
-A single-file MCP server that schedules and executes Claude Code CLI tasks.
+A single-file MCP server that schedules and executes AI tasks via multiple providers.
+Supports Claude (Agent SDK), OpenAI (Responses API), and Ollama (local inference).
 """
 
 import sqlite3
@@ -19,8 +20,11 @@ import secrets
 import ast
 import importlib.util
 import inspect
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Callable, Optional
 
 # Load environment variables from .env file
 from dotenv import load_dotenv
@@ -47,6 +51,13 @@ try:
 except ImportError:
     AGENT_SDK_AVAILABLE = False
     print("Warning: claude-agent-sdk not installed. Run: pip install claude-agent-sdk", file=sys.stderr)
+
+# OpenAI SDK for OpenAI provider
+try:
+    import openai as openai_module
+    OPENAI_SDK_AVAILABLE = True
+except ImportError:
+    OPENAI_SDK_AVAILABLE = False
 
 # ngrok for remote access
 try:
@@ -105,6 +116,69 @@ PRICING = {
     "claude-haiku-4-5-20250514": {"input": 1.00, "output": 5.00},
     "default": {"input": 3.00, "output": 15.00}  # Fallback to Sonnet pricing
 }
+
+# OpenAI pricing per 1M tokens
+OPENAI_PRICING = {
+    "gpt-4o": {"input": 2.50, "output": 10.00},
+    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
+    "gpt-4o-2024-11-20": {"input": 2.50, "output": 10.00},
+    "o3": {"input": 10.00, "output": 40.00},
+    "o3-mini": {"input": 1.10, "output": 4.40},
+    "o4-mini": {"input": 1.10, "output": 4.40},
+    "default": {"input": 2.50, "output": 10.00}
+}
+
+
+# === Provider Abstraction ===
+
+@dataclass
+class ProviderResult:
+    """Result from a provider execution"""
+    output_parts: list = field(default_factory=list)  # [{type: "text", text: "..."}, ...]
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    model: str | None = None
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    web_search_requests: int = 0
+    final_result: str | None = None
+
+
+class BaseProvider(ABC):
+    """Abstract base class for AI providers"""
+
+    @abstractmethod
+    async def execute(
+        self,
+        prompt: str,
+        cwd: str,
+        allowed_tools: list[str],
+        mcp_config: dict,
+        timeout_seconds: int,
+        on_progress: Optional[Callable] = None,
+    ) -> ProviderResult:
+        """Execute a prompt and return results"""
+        ...
+
+    @abstractmethod
+    def get_pricing(self) -> dict[str, dict[str, float]]:
+        """Return pricing dict for this provider's models"""
+        ...
+
+    @abstractmethod
+    def is_available(self) -> bool:
+        """Check if this provider is available (SDK installed, API key set, etc.)"""
+        ...
+
+    def get_capabilities(self) -> dict:
+        """Return provider capabilities"""
+        return {"streaming": False, "mcp_tools": False, "tool_use": False}
+
+
+# Provider registry - populated at startup
+PROVIDERS: dict[str, BaseProvider] = {}
+
 
 def parse_token_usage(output: str) -> dict:
     """Parse token usage and model info from Claude CLI output"""
@@ -363,6 +437,7 @@ def init_db():
             description TEXT,
             secret_token TEXT UNIQUE NOT NULL,
             prompt_template TEXT NOT NULL,
+            command TEXT DEFAULT 'claude',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             last_triggered_at TEXT,
@@ -459,6 +534,9 @@ def init_db():
     except: pass
     try:
         conn.execute("ALTER TABLE runs ADD COLUMN web_search_requests INTEGER DEFAULT 0")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE webhooks ADD COLUMN command TEXT DEFAULT 'claude'")
     except: pass
     conn.commit()
     return conn
@@ -1174,6 +1252,9 @@ DASHBOARD_HTML = """
         <div class="quick-run">
             <h3>Run Custom Prompt</h3>
             <div class="quick-run-form">
+                <select id="quick-provider" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-secondary); color: var(--text-primary); font-size: 14px; cursor: pointer; min-width: 110px;">
+                    <option value="claude">Claude</option>
+                </select>
                 <input type="text" id="quick-prompt" class="quick-run-input" placeholder="Enter a prompt to run immediately..." onkeydown="if(event.key==='Enter')runQuickPrompt()">
                 <button class="quick-run-btn" id="quick-run-btn" onclick="runQuickPrompt()">Run Now</button>
             </div>
@@ -1231,11 +1312,11 @@ DASHBOARD_HTML = """
         <div id="webhooks" class="section">
             <div class="card">
                 <h2>Webhook Endpoints</h2>
-                <p style="color: var(--text-secondary); margin-bottom: var(--spacing-md); font-size: 13px;">Webhooks allow external services to trigger Claude prompts via HTTP POST requests.</p>
+                <p style="color: var(--text-secondary); margin-bottom: var(--spacing-md); font-size: 13px;">Webhooks allow external services to trigger AI prompts via HTTP POST requests.</p>
                 <div class="table-wrapper">
                     <table>
                         <thead>
-                            <tr><th>Name</th><th>URL</th><th>Triggers</th><th>Last Triggered</th><th>Status</th><th>Actions</th></tr>
+                            <tr><th>Name</th><th>URL</th><th>Provider</th><th>Triggers</th><th>Last Triggered</th><th>Status</th><th>Actions</th></tr>
                         </thead>
                         <tbody id="webhooks-table"></tbody>
                     </table>
@@ -1467,6 +1548,128 @@ DASHBOARD_HTML = """
                     showToast('Error killing run: ' + e.message, 'error');
                 }
             });
+        }
+
+        function renderWebhooksTable(webhooks) {
+            const table = document.getElementById('webhooks-table');
+            // Clear safely
+            while (table.firstChild) table.removeChild(table.firstChild);
+
+            if (webhooks.length === 0) {
+                const row = document.createElement('tr');
+                const cell = document.createElement('td');
+                cell.colSpan = 7;
+                cell.style.cssText = 'text-align: center; color: var(--text-muted); padding: var(--spacing-lg);';
+                cell.textContent = 'No webhooks configured. Create one using the MCP tool.';
+                row.appendChild(cell);
+                table.appendChild(row);
+                return;
+            }
+
+            const providerLabels = { claude: 'Claude', openai: 'OpenAI', ollama: 'Ollama' };
+            const availableProviders = Object.keys(providerLabels);
+
+            webhooks.forEach(w => {
+                const row = document.createElement('tr');
+
+                // Name
+                const nameCell = document.createElement('td');
+                const nameStrong = document.createElement('strong');
+                nameStrong.style.color = 'var(--text-primary)';
+                nameStrong.textContent = w.name;
+                nameCell.appendChild(nameStrong);
+                if (w.description) {
+                    nameCell.appendChild(document.createElement('br'));
+                    const desc = document.createElement('small');
+                    desc.style.color = 'var(--text-muted)';
+                    desc.textContent = w.description;
+                    nameCell.appendChild(desc);
+                }
+                row.appendChild(nameCell);
+
+                // URL
+                const urlCell = document.createElement('td');
+                const urlCode = document.createElement('code');
+                urlCode.style.cssText = 'font-size: 11px; word-break: break-all; color: var(--accent-cyan);';
+                urlCode.textContent = w.url;
+                urlCell.appendChild(urlCode);
+                const copyBtn = document.createElement('button');
+                copyBtn.className = 'view-btn';
+                copyBtn.style.marginLeft = '8px';
+                copyBtn.textContent = 'Copy';
+                copyBtn.onclick = () => copyToClipboard(w.url);
+                urlCell.appendChild(copyBtn);
+                row.appendChild(urlCell);
+
+                // Provider dropdown
+                const providerCell = document.createElement('td');
+                const select = document.createElement('select');
+                select.style.cssText = 'padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text-primary); font-size: 12px; cursor: pointer;';
+                availableProviders.forEach(p => {
+                    const opt = document.createElement('option');
+                    opt.value = p;
+                    opt.textContent = providerLabels[p];
+                    if (p === (w.command || 'claude')) opt.selected = true;
+                    select.appendChild(opt);
+                });
+                select.onchange = () => updateWebhookProvider(w.id, select.value);
+                providerCell.appendChild(select);
+                row.appendChild(providerCell);
+
+                // Triggers
+                const triggersCell = document.createElement('td');
+                triggersCell.textContent = w.trigger_count;
+                row.appendChild(triggersCell);
+
+                // Last triggered
+                const lastCell = document.createElement('td');
+                lastCell.style.color = 'var(--text-secondary)';
+                lastCell.textContent = w.last_triggered_at ? new Date(w.last_triggered_at).toLocaleString() : 'Never';
+                row.appendChild(lastCell);
+
+                // Status
+                const statusCell = document.createElement('td');
+                const statusSpan = document.createElement('span');
+                statusSpan.className = 'status ' + (w.enabled ? 'enabled' : 'disabled');
+                statusSpan.textContent = w.enabled ? 'Active' : 'Disabled';
+                statusCell.appendChild(statusSpan);
+                row.appendChild(statusCell);
+
+                // Actions
+                const actionsCell = document.createElement('td');
+                const promptBtn = document.createElement('button');
+                promptBtn.className = 'view-btn';
+                promptBtn.textContent = 'View Prompt';
+                promptBtn.onclick = () => viewWebhookPrompt(w.id);
+                actionsCell.appendChild(promptBtn);
+                const runsBtn = document.createElement('button');
+                runsBtn.className = 'view-btn';
+                runsBtn.style.marginLeft = '5px';
+                runsBtn.textContent = 'View Runs';
+                runsBtn.onclick = () => showWebhookRuns(w.id);
+                actionsCell.appendChild(runsBtn);
+                row.appendChild(actionsCell);
+
+                table.appendChild(row);
+            });
+        }
+
+        async function updateWebhookProvider(webhookId, command) {
+            try {
+                const res = await fetch('/api/webhook/' + webhookId + '/provider', {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command })
+                });
+                const data = await res.json();
+                if (data.error) {
+                    showToast('Error: ' + data.error, 'error');
+                } else {
+                    showToast('Provider updated', 'success');
+                }
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
         }
 
         function viewWebhookPrompt(webhookId) {
@@ -1937,6 +2140,7 @@ DASHBOARD_HTML = """
                     const tokens = r.total_tokens || 0;
                     const cost = r.cost_usd || 0;
                     const isRunning = r.state === 'running' || r.state === 'pending';
+                    const providerLabel = {claude: 'Claude', openai: 'OpenAI', ollama: 'Ollama'}[r.command] || r.command || 'Claude';
                     return `
                     <div class="run-card run-card--manual" onclick="showRunDetails('${r.id}')">
                         <div class="run-card__prompt">
@@ -1945,6 +2149,7 @@ DASHBOARD_HTML = """
                         </div>
                         <div class="run-card__meta">
                             <span class="status badge-manual">Manual</span>
+                            <span class="status" style="background: var(--bg-tertiary); color: var(--accent-cyan); font-size: 11px;">${escapeHtml(providerLabel)}${r.model ? ' · ' + escapeHtml(r.model) : ''}</span>
                             <span class="status ${r.state}">${isRunning ? '<span class="live-dot"></span>' : ''}${r.state}</span>
                             <span class="run-card__time">${timeAgo(r.started_at)}</span>
                             <span class="run-card__stats">${tokens > 0 ? tokens.toLocaleString() + ' tokens' : ''}${cost > 0 ? ' · $' + cost.toFixed(4) : ''}</span>
@@ -2007,27 +2212,7 @@ DASHBOARD_HTML = """
             `}).join('');
 
             // Render webhooks
-            document.getElementById('webhooks-table').innerHTML = webhooksRes.length === 0
-                ? '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: var(--spacing-lg);">No webhooks configured. Create one using the MCP tool.</td></tr>'
-                : webhooksRes.map(w => `
-                <tr>
-                    <td>
-                        <strong style="color: var(--text-primary);">${escapeHtml(w.name)}</strong>
-                        ${w.description ? '<br><small style="color: var(--text-muted);">' + escapeHtml(w.description) + '</small>' : ''}
-                    </td>
-                    <td>
-                        <code style="font-size: 11px; word-break: break-all; color: var(--accent-cyan);">${escapeHtml(w.url)}</code>
-                        <button class="view-btn" style="margin-left: 8px;" onclick="copyToClipboard('${escapeHtml(w.url)}')">Copy</button>
-                    </td>
-                    <td>${w.trigger_count}</td>
-                    <td style="color: var(--text-secondary);">${w.last_triggered_at ? new Date(w.last_triggered_at).toLocaleString() : 'Never'}</td>
-                    <td><span class="status ${w.enabled ? 'enabled' : 'disabled'}">${w.enabled ? 'Active' : 'Disabled'}</span></td>
-                    <td>
-                        <button class="view-btn" onclick="viewWebhookPrompt('${w.id}')">View Prompt</button>
-                        <button class="view-btn" style="margin-left: 5px;" onclick="showWebhookRuns('${w.id}')">View Runs</button>
-                    </td>
-                </tr>
-            `).join('');
+            renderWebhooksTable(webhooksRes);
 
             // Render tool logs table
             const toolLogsTable = document.getElementById('tool-logs-table');
@@ -2153,6 +2338,7 @@ DASHBOARD_HTML = """
         async function runQuickPrompt() {
             const input = document.getElementById('quick-prompt');
             const btn = document.getElementById('quick-run-btn');
+            const providerSelect = document.getElementById('quick-provider');
             const prompt = input.value.trim();
 
             if (!prompt) {
@@ -2164,10 +2350,11 @@ DASHBOARD_HTML = """
             btn.textContent = 'Starting...';
 
             try {
+                const command = providerSelect ? providerSelect.value : 'claude';
                 const res = await fetch('/api/run-prompt', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt })
+                    body: JSON.stringify({ prompt, command })
                 });
                 const data = await res.json();
 
@@ -2585,6 +2772,32 @@ DASHBOARD_HTML = """
         // Load settings on page load
         loadSettings();
 
+        // Load available providers and populate dropdowns
+        async function loadProviders() {
+            try {
+                const res = await fetch('/api/providers');
+                const data = await res.json();
+                const select = document.getElementById('quick-provider');
+                if (select && data.providers) {
+                    // Clear existing options safely
+                    while (select.firstChild) select.removeChild(select.firstChild);
+                    const providerLabels = { claude: 'Claude', openai: 'OpenAI', ollama: 'Ollama' };
+                    for (const [name, info] of Object.entries(data.providers)) {
+                        if (info.available) {
+                            const opt = document.createElement('option');
+                            opt.value = name;
+                            opt.textContent = providerLabels[name] || name;
+                            if (name === data.default) opt.selected = true;
+                            select.appendChild(opt);
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to load providers:', e);
+            }
+        }
+        loadProviders();
+
         // Check ngrok status once on load
         updateNgrokStatus();
 
@@ -2695,6 +2908,14 @@ async def api_run_prompt_handler(request):
         if not prompt:
             return JSONResponse({"error": "Prompt is required"}, status_code=400)
 
+        # Get provider from request (default to first available or "claude")
+        command = body.get('command', _get_default_provider())
+
+        # Validate provider is registered
+        if command not in PROVIDERS:
+            available = list(PROVIDERS.keys())
+            return JSONResponse({"error": f"Provider '{command}' not available. Available: {available}"}, status_code=400)
+
         # Create a one-off job
         job_id = str(uuid.uuid4())[:8]
         now = utc_now_iso()
@@ -2703,7 +2924,7 @@ async def api_run_prompt_handler(request):
         conn.execute("""
             INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (job_id, f"Manual Run ({now[:16]})", "manual", prompt, "claude", "[]", "{}", 0, now, now))
+        """, (job_id, f"Manual Run ({now[:16]})", "manual", prompt, command, "[]", "{}", 0, now, now))
         conn.commit()
 
         # Create and trigger the run
@@ -2711,7 +2932,7 @@ async def api_run_prompt_handler(request):
         conn.execute("""
             INSERT INTO runs (id, job_id, started_at, prompt, command, state)
             VALUES (?, ?, ?, ?, ?, 'pending')
-        """, (run_id, job_id, now, prompt, "claude"))
+        """, (run_id, job_id, now, prompt, command))
         conn.commit()
         conn.close()
 
@@ -2774,6 +2995,24 @@ async def api_ngrok_handler(request):
     return JSONResponse({
         "url": NGROK_PUBLIC_URL,
         "sse_endpoint": f"{NGROK_PUBLIC_URL}/sse" if NGROK_PUBLIC_URL else None
+    })
+
+@require_auth
+async def api_providers_handler(request):
+    """Get available AI providers and their capabilities"""
+    providers = {}
+    for name, provider in PROVIDERS.items():
+        providers[name] = {
+            "available": provider.is_available(),
+            "capabilities": provider.get_capabilities(),
+        }
+    # Also include providers that are known but not registered
+    for name in ["claude", "openai", "ollama"]:
+        if name not in providers:
+            providers[name] = {"available": False, "capabilities": {}}
+    return JSONResponse({
+        "providers": providers,
+        "default": _get_default_provider(),
     })
 
 @require_auth
@@ -3025,6 +3264,24 @@ async def api_tool_logs_handler(request):
     conn.close()
     return JSONResponse([dict(l) for l in logs])
 
+@require_auth
+async def api_webhook_provider_handler(request):
+    """Update a webhook's AI provider"""
+    webhook_id = request.path_params['webhook_id']
+    try:
+        body = await request.json()
+        command = body.get('command', 'claude')
+        conn = get_db()
+        conn.execute(
+            "UPDATE webhooks SET command = ?, updated_at = ? WHERE id = ?",
+            (command, utc_now_iso(), webhook_id)
+        )
+        conn.commit()
+        conn.close()
+        return JSONResponse({"success": True})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 async def webhook_trigger_handler(request):
     """Handle incoming webhook POST requests"""
     token = request.path_params.get("token")
@@ -3050,6 +3307,15 @@ async def webhook_trigger_handler(request):
         # Render the prompt template with payload data
         prompt = render_webhook_template(webhook["prompt_template"], payload)
 
+        # Determine provider: webhook setting > payload override > default
+        command = webhook.get("command") or "claude"
+        if command not in PROVIDERS:
+            command = _get_default_provider()
+        if isinstance(payload, dict) and payload.get('_provider'):
+            req_provider = payload['_provider']
+            if req_provider in PROVIDERS:
+                command = req_provider
+
         # Create a disabled job for this webhook run (follows quick-run pattern)
         job_id = str(uuid.uuid4())[:8]
         now = utc_now_iso()
@@ -3057,14 +3323,14 @@ async def webhook_trigger_handler(request):
         conn.execute("""
             INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, created_at, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (job_id, f"Webhook: {webhook['name']} ({now[:16]})", "webhook", prompt, "claude", "[]", "{}", 0, now, now))
+        """, (job_id, f"Webhook: {webhook['name']} ({now[:16]})", "webhook", prompt, command, "[]", "{}", 0, now, now))
 
         # Create the run with webhook_id
         run_id = str(uuid.uuid4())[:8]
         conn.execute("""
             INSERT INTO runs (id, job_id, started_at, prompt, command, state, webhook_id)
             VALUES (?, ?, ?, ?, ?, 'pending', ?)
-        """, (run_id, job_id, now, prompt, "claude", webhook["id"]))
+        """, (run_id, job_id, now, prompt, command, webhook["id"]))
 
         # Update webhook stats
         conn.execute("""
@@ -3618,6 +3884,7 @@ dashboard_routes = [
     Route("/api/job/{job_id}/trigger", api_trigger_job_handler, methods=["POST"]),
     Route("/api/stats", api_stats_handler),
     Route("/api/ngrok", api_ngrok_handler),
+    Route("/api/providers", api_providers_handler, methods=["GET"]),
     Route("/api/settings", api_settings_get_handler, methods=["GET"]),
     Route("/api/settings", api_settings_post_handler, methods=["POST"]),
     Route("/api/mcp-available", api_mcp_available_handler, methods=["GET"]),
@@ -3627,6 +3894,7 @@ dashboard_routes = [
     Route("/api/fixed-server-toggle", api_fixed_server_toggle_handler, methods=["POST"]),
     Route("/api/dynamic-server-toggle", api_dynamic_server_toggle_handler, methods=["POST"]),
     Route("/api/webhooks", api_webhooks_handler),
+    Route("/api/webhook/{webhook_id}/provider", api_webhook_provider_handler, methods=["PUT"]),
     Route("/api/tool-logs", api_tool_logs_handler),
     Route("/webhook/{token}", webhook_trigger_handler, methods=["POST"]),
     # OAuth 2.1 endpoints
@@ -3663,8 +3931,10 @@ def create_job(name: str, cron: str, prompt: str, command: str = "claude", tools
     Args:
         name: Human-readable job name
         cron: Cron expression (e.g., "0 9 * * 1-5" for weekdays at 9am)
-        prompt: The prompt to send to Claude Code
-        command: CLI command (default: "claude")
+        prompt: The prompt to send to the AI provider
+        command: AI provider to use: "claude" (default), "openai", or "ollama".
+                 Claude uses the Agent SDK, OpenAI uses the chat completions API,
+                 and Ollama uses the local HTTP API.
         tools: JSON array of MCP tools to enable. Tool names are auto-normalized:
                - "email:send_email" -> "mcp__email__send_email"
                - "email.send_email" -> "mcp__email__send_email"
@@ -3858,7 +4128,7 @@ def trigger_job(job_id: str) -> str:
 # === Webhook Tools ===
 
 @mcp.tool()
-def create_webhook(name: str, prompt_template: str, description: str = "") -> str:
+def create_webhook(name: str, prompt_template: str, description: str = "", command: str = "claude") -> str:
     """
     Create a webhook endpoint that executes a prompt when triggered via HTTP POST.
 
@@ -3870,6 +4140,12 @@ def create_webhook(name: str, prompt_template: str, description: str = "") -> st
     Example template:
     "A new work item was created: {{payload.resource.fields.System.Title}}"
 
+    Args:
+        name: Human-readable webhook name
+        prompt_template: Template with {{payload}} placeholders
+        description: Optional description
+        command: AI provider to use: "claude" (default), "openai", or "ollama"
+
     Returns the full webhook URL with security token.
     """
     webhook_id = str(uuid.uuid4())[:8]
@@ -3878,9 +4154,9 @@ def create_webhook(name: str, prompt_template: str, description: str = "") -> st
 
     conn = get_db()
     conn.execute("""
-        INSERT INTO webhooks (id, name, description, secret_token, prompt_template, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (webhook_id, name, description, secret_token, prompt_template, now, now))
+        INSERT INTO webhooks (id, name, description, secret_token, prompt_template, command, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (webhook_id, name, description, secret_token, prompt_template, command, now, now))
     conn.commit()
 
     conn.close()
@@ -3929,8 +4205,17 @@ def get_webhook(webhook_id: str) -> str:
     return json.dumps(result, indent=2)
 
 @mcp.tool()
-def update_webhook(webhook_id: str, name: str = None, prompt_template: str = None, description: str = None, enabled: bool = None) -> str:
-    """Update an existing webhook"""
+def update_webhook(webhook_id: str, name: str = None, prompt_template: str = None, description: str = None, enabled: bool = None, command: str = None) -> str:
+    """Update an existing webhook.
+
+    Args:
+        webhook_id: The webhook ID to update
+        name: New webhook name
+        prompt_template: New prompt template
+        description: New description
+        enabled: Enable/disable the webhook
+        command: AI provider to use: "claude", "openai", or "ollama"
+    """
     conn = get_db()
     webhook = conn.execute("SELECT * FROM webhooks WHERE id = ?", (webhook_id,)).fetchone()
     if not webhook:
@@ -3952,6 +4237,9 @@ def update_webhook(webhook_id: str, name: str = None, prompt_template: str = Non
     if enabled is not None:
         updates.append("enabled = ?")
         params.append(1 if enabled else 0)
+    if command is not None:
+        updates.append("command = ?")
+        params.append(command)
 
     if updates:
         updates.append("updated_at = ?")
@@ -4636,6 +4924,615 @@ def should_run(job: dict, now: datetime) -> bool:
 
     return last_executed < prev_run
 
+
+# === Provider Implementations ===
+
+def _extract_tool_schema(func) -> dict:
+    """Extract JSON Schema for function parameters using inspect.signature() and docstrings."""
+    sig = inspect.signature(func)
+    properties = {}
+    required = []
+
+    type_map = {
+        str: "string",
+        int: "integer",
+        float: "number",
+        bool: "boolean",
+        list: "array",
+        dict: "object",
+    }
+
+    for name, param in sig.parameters.items():
+        if name in ("self", "cls"):
+            continue
+        prop = {}
+        annotation = param.annotation
+        if annotation != inspect.Parameter.empty:
+            prop["type"] = type_map.get(annotation, "string")
+        else:
+            prop["type"] = "string"
+
+        if param.default != inspect.Parameter.empty:
+            prop["default"] = param.default
+        else:
+            required.append(name)
+
+        properties[name] = prop
+
+    schema = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = required
+    return schema
+
+
+def _convert_mcp_tools_to_functions(mcp_config: dict) -> tuple[list[dict], dict]:
+    """
+    Convert MCP server tools to OpenAI-compatible function definitions.
+    Returns (tool_definitions, tool_callables) where:
+      - tool_definitions: list of OpenAI tool dicts
+      - tool_callables: dict mapping function name -> callable
+    """
+    tool_definitions = []
+    tool_callables = {}
+
+    for server_name, config in mcp_config.items():
+        # Only handle Python-based MCP servers (stdio with python/python3 command)
+        command = config.get("command", "")
+        args = config.get("args", [])
+
+        # Find the server.py path from args
+        server_path = None
+        if "python" in command or "python3" in command:
+            for arg in args:
+                if arg.endswith(".py") or arg.endswith("/server.py"):
+                    server_path = Path(arg)
+                    break
+        elif args:
+            # Try the first arg as a potential Python file
+            candidate = Path(args[0]) if args else None
+            if candidate and candidate.exists() and candidate.suffix == ".py":
+                server_path = candidate
+
+        if not server_path:
+            # Try standard location for dynamic/fixed servers
+            for base_dir in [DYNAMIC_SERVERS_DIR, FIXED_SERVERS_DIR]:
+                candidate = base_dir / server_name / "server.py"
+                if candidate.exists():
+                    server_path = candidate
+                    break
+
+        if not server_path or not server_path.exists():
+            print(f"[providers] Skipping MCP server '{server_name}': cannot find server.py", file=sys.stderr)
+            continue
+
+        # Inject server env vars so in-process module imports see them via os.environ
+        server_env = config.get('env', {})
+        old_env = {}
+        for k, v in server_env.items():
+            old_env[k] = os.environ.get(k)
+            os.environ[k] = v
+
+        try:
+            # Discover tools from the server file
+            tool_names = _discover_python_mcp_tools(server_path)
+            if not tool_names:
+                continue
+
+            for tool_name in tool_names:
+                func, error = _load_mcp_tool_from_file(server_name, server_path, tool_name)
+                if error or not func:
+                    print(f"[providers] Skipping tool '{tool_name}' from '{server_name}': {error}", file=sys.stderr)
+                    continue
+
+                # Build OpenAI-compatible function definition
+                qualified_name = f"mcp__{server_name}__{tool_name}"
+                schema = _extract_tool_schema(func)
+                description = (func.__doc__ or f"Tool '{tool_name}' from MCP server '{server_name}'").strip()
+
+                tool_definitions.append({
+                    "type": "function",
+                    "function": {
+                        "name": qualified_name,
+                        "description": description[:1024],  # OpenAI limit
+                        "parameters": schema,
+                    }
+                })
+                tool_callables[qualified_name] = func
+                print(f"[providers] Loaded tool: {qualified_name}", file=sys.stderr)
+        finally:
+            # Restore original env vars
+            for k, prev in old_env.items():
+                if prev is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = prev
+
+    return tool_definitions, tool_callables
+
+
+class ClaudeProvider(BaseProvider):
+    """Provider that executes via the Claude Agent SDK (Claude Code CLI)"""
+
+    async def execute(self, prompt, cwd, allowed_tools, mcp_config,
+                      timeout_seconds, on_progress=None) -> ProviderResult:
+        if not AGENT_SDK_AVAILABLE:
+            raise RuntimeError("Claude Agent SDK not installed. Run: pip install claude-agent-sdk")
+
+        # Define stderr handler
+        def stderr_handler(line: str):
+            print(f"[CLI stderr] {line}", file=sys.stderr)
+
+        # Build SDK options
+        if mcp_config:
+            mcp_tool_allowlist = _discover_mcp_tool_allowlist(mcp_config)
+            if mcp_tool_allowlist:
+                merged_tools = _merge_tool_lists(allowed_tools, mcp_tool_allowlist)
+            else:
+                merged_tools = allowed_tools
+                print("[ClaudeProvider] No MCP tools discovered; MCP tool access may be restricted", file=sys.stderr)
+            builtin_allowed_tools = _filter_builtin_tools(merged_tools)
+
+            for server_name, server_config in mcp_config.items():
+                cmd = server_config.get('command', 'N/A')
+                args = server_config.get('args', [])
+                env_keys = list(server_config.get('env', {}).keys())
+                print(f"[ClaudeProvider] MCP server '{server_name}': cmd={cmd}, args={args[:2]}..., env_keys={env_keys}", file=sys.stderr)
+
+            sdk_options = ClaudeAgentOptions(
+                tools=builtin_allowed_tools,
+                allowed_tools=merged_tools,
+                permission_mode="bypassPermissions",
+                cwd=cwd,
+                stderr=stderr_handler,
+                mcp_servers=mcp_config,
+            )
+        else:
+            builtin_allowed_tools = _filter_builtin_tools(allowed_tools)
+            sdk_options = ClaudeAgentOptions(
+                tools=builtin_allowed_tools,
+                allowed_tools=allowed_tools,
+                permission_mode="bypassPermissions",
+                cwd=cwd,
+                stderr=stderr_handler,
+            )
+
+        # Execute via Agent SDK with streaming
+        output_parts = []
+        usage = {
+            "input_tokens": 0, "output_tokens": 0, "cost_usd": 0.0,
+            "model": None, "cache_read_tokens": 0, "cache_creation_tokens": 0,
+            "web_search_requests": 0,
+        }
+        processed_ids = set()
+        final_result = None
+
+        print(f"[ClaudeProvider] Starting SDK query (timeout={timeout_seconds}s)", file=sys.stderr)
+
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                async for message in sdk_query(prompt=prompt, options=sdk_options):
+                    msg_type = getattr(message, 'type', None)
+                    msg_subtype = getattr(message, 'subtype', None)
+
+                    # Capture assistant messages
+                    if hasattr(message, 'content') and message.content:
+                        content = message.content
+                        if isinstance(content, str):
+                            output_parts.append({"type": "text", "text": content})
+                        elif isinstance(content, list):
+                            for block in content:
+                                output_parts.append(serialize_content_block(block))
+                        else:
+                            output_parts.append(serialize_content_block(content))
+
+                    # Capture from nested message structure
+                    if msg_type == 'assistant' and hasattr(message, 'message'):
+                        nested_content = getattr(message.message, 'content', [])
+                        if isinstance(nested_content, list):
+                            for block in nested_content:
+                                output_parts.append(serialize_content_block(block))
+
+                    # Capture token usage (deduplicated)
+                    msg_id = getattr(message, 'id', None)
+                    if hasattr(message, 'usage') and message.usage:
+                        if msg_id is None or msg_id not in processed_ids:
+                            if msg_id is not None:
+                                processed_ids.add(msg_id)
+                            u = message.usage
+                            if hasattr(u, 'input_tokens'):
+                                usage["input_tokens"] = u.input_tokens
+                            elif isinstance(u, dict):
+                                usage["input_tokens"] = u.get("input_tokens", usage["input_tokens"])
+                            if hasattr(u, 'output_tokens'):
+                                usage["output_tokens"] = u.output_tokens
+                            elif isinstance(u, dict):
+                                usage["output_tokens"] = u.get("output_tokens", usage["output_tokens"])
+                            cache_read = getattr(u, 'cache_read_input_tokens', None) or (u.get('cache_read_input_tokens') if isinstance(u, dict) else None)
+                            if cache_read:
+                                usage["cache_read_tokens"] = cache_read
+                            cache_creation = getattr(u, 'cache_creation_input_tokens', None) or (u.get('cache_creation_input_tokens') if isinstance(u, dict) else None)
+                            if cache_creation:
+                                usage["cache_creation_tokens"] = cache_creation
+
+                    if hasattr(message, 'model') and message.model:
+                        usage["model"] = message.model
+
+                    if hasattr(message, 'total_cost_usd') and message.total_cost_usd:
+                        usage["cost_usd"] = message.total_cost_usd
+                    if hasattr(message, 'model_usage') and message.model_usage:
+                        mu = message.model_usage
+                        if isinstance(mu, dict):
+                            for model_info in mu.values():
+                                if isinstance(model_info, dict):
+                                    usage["web_search_requests"] += model_info.get('web_search_requests', 0)
+                        elif hasattr(mu, '__iter__'):
+                            for model_info in mu:
+                                ws = getattr(model_info, 'web_search_requests', 0)
+                                if ws:
+                                    usage["web_search_requests"] += ws
+
+                    if hasattr(message, 'result') and message.result:
+                        final_result = message.result
+
+                    # Progress callback for streaming DB updates
+                    if on_progress:
+                        on_progress(output_parts)
+
+        except asyncio.TimeoutError:
+            raise Exception(f"Timeout after {timeout_seconds // 60} minutes")
+
+        # Calculate cost if not provided by SDK
+        total_tokens = usage["input_tokens"] + usage["output_tokens"]
+        if usage["cost_usd"] == 0.0 and total_tokens > 0:
+            model = usage["model"] or "default"
+            pricing = PRICING.get(model, PRICING["default"])
+            input_cost = (usage["input_tokens"] / 1_000_000) * pricing["input"]
+            output_cost = (usage["output_tokens"] / 1_000_000) * pricing["output"]
+            usage["cost_usd"] = round(input_cost + output_cost, 6)
+
+        return ProviderResult(
+            output_parts=output_parts,
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            cost_usd=usage["cost_usd"],
+            model=usage["model"],
+            cache_read_tokens=usage["cache_read_tokens"],
+            cache_creation_tokens=usage["cache_creation_tokens"],
+            web_search_requests=usage["web_search_requests"],
+            final_result=final_result,
+        )
+
+    def get_pricing(self) -> dict[str, dict[str, float]]:
+        return PRICING
+
+    def is_available(self) -> bool:
+        return AGENT_SDK_AVAILABLE
+
+    def get_capabilities(self) -> dict:
+        return {"streaming": True, "mcp_tools": True, "tool_use": True}
+
+
+class OpenAIProvider(BaseProvider):
+    """Provider that executes via the OpenAI API with function calling"""
+
+    def __init__(self):
+        self.model = os.environ.get("OPENAI_MODEL", "gpt-4o")
+        self.max_tool_iterations = 20
+
+    async def execute(self, prompt, cwd, allowed_tools, mcp_config,
+                      timeout_seconds, on_progress=None) -> ProviderResult:
+        if not OPENAI_SDK_AVAILABLE:
+            raise RuntimeError("OpenAI SDK not installed. Run: pip install openai")
+
+        api_key = os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY environment variable not set")
+
+        client = openai_module.AsyncOpenAI(api_key=api_key)
+        model = os.environ.get("OPENAI_MODEL", self.model)
+
+        # Convert MCP tools to OpenAI function calling format
+        tool_definitions, tool_callables = _convert_mcp_tools_to_functions(mcp_config)
+        print(f"[OpenAIProvider] model={model}, tools={len(tool_definitions)}", file=sys.stderr)
+
+        output_parts = []
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                for iteration in range(self.max_tool_iterations + 1):
+                    # Build API call kwargs
+                    kwargs = {"model": model, "messages": messages}
+                    if tool_definitions and iteration < self.max_tool_iterations:
+                        kwargs["tools"] = tool_definitions
+
+                    response = await client.chat.completions.create(**kwargs)
+                    choice = response.choices[0]
+                    message = choice.message
+
+                    # Track tokens
+                    if response.usage:
+                        total_input_tokens += response.usage.prompt_tokens or 0
+                        total_output_tokens += response.usage.completion_tokens or 0
+
+                    # Capture text content
+                    if message.content:
+                        output_parts.append({"type": "text", "text": message.content})
+
+                    # Check for tool calls
+                    if not message.tool_calls:
+                        break  # No tool calls — we're done
+
+                    # Process tool calls
+                    messages.append(message.model_dump())  # Add assistant message with tool_calls
+
+                    for tool_call in message.tool_calls:
+                        fn_name = tool_call.function.name
+                        try:
+                            parsed_input = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                        except (json.JSONDecodeError, TypeError):
+                            parsed_input = {"raw": tool_call.function.arguments}
+                        output_parts.append({
+                            "type": "tool_use",
+                            "id": tool_call.id,
+                            "name": fn_name,
+                            "input": parsed_input,
+                        })
+
+                        # Execute the tool
+                        tool_result = ""
+                        is_error = False
+                        if fn_name in tool_callables:
+                            try:
+                                args = parsed_input if isinstance(parsed_input, dict) else {}
+                                func = tool_callables[fn_name]
+                                if asyncio.iscoroutinefunction(func):
+                                    result = await func(**args)
+                                else:
+                                    result = func(**args)
+                                tool_result = str(result) if result is not None else ""
+                            except Exception as e:
+                                tool_result = f"Error: {e}"
+                                is_error = True
+                        else:
+                            tool_result = f"Tool '{fn_name}' not found"
+                            is_error = True
+
+                        output_parts.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_call.id,
+                            "content": tool_result[:10000],  # Limit result size
+                            "is_error": is_error,
+                        })
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_result[:10000],
+                        })
+
+                        print(f"[OpenAIProvider] Tool {fn_name}: {'error' if is_error else 'ok'}", file=sys.stderr)
+
+                    if on_progress:
+                        on_progress(output_parts)
+
+        except asyncio.TimeoutError:
+            raise Exception(f"Timeout after {timeout_seconds // 60} minutes")
+
+        # Calculate cost
+        pricing = OPENAI_PRICING.get(model, OPENAI_PRICING["default"])
+        input_cost = (total_input_tokens / 1_000_000) * pricing["input"]
+        output_cost = (total_output_tokens / 1_000_000) * pricing["output"]
+        cost = round(input_cost + output_cost, 6)
+
+        return ProviderResult(
+            output_parts=output_parts,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            cost_usd=cost,
+            model=model,
+        )
+
+    def get_pricing(self) -> dict[str, dict[str, float]]:
+        return OPENAI_PRICING
+
+    def is_available(self) -> bool:
+        return OPENAI_SDK_AVAILABLE and bool(os.environ.get("OPENAI_API_KEY"))
+
+    def get_capabilities(self) -> dict:
+        return {"streaming": True, "mcp_tools": True, "tool_use": True}
+
+
+class OllamaProvider(BaseProvider):
+    """Provider for local AI servers (Ollama, LM Studio, etc.) via OpenAI-compatible API"""
+
+    def __init__(self):
+        self.model = os.environ.get("OLLAMA_MODEL", "llama3.1")
+        self.base_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+        self.max_tool_iterations = 15
+
+    def _get_openai_base_url(self) -> str:
+        """Get the OpenAI-compatible base URL (append /v1 if needed)"""
+        url = os.environ.get("OLLAMA_URL", self.base_url).rstrip("/")
+        if not url.endswith("/v1"):
+            url = url + "/v1"
+        return url
+
+    async def execute(self, prompt, cwd, allowed_tools, mcp_config,
+                      timeout_seconds, on_progress=None) -> ProviderResult:
+        if not OPENAI_SDK_AVAILABLE:
+            raise RuntimeError("OpenAI SDK not installed (needed for local provider). Run: pip install openai")
+
+        model = os.environ.get("OLLAMA_MODEL", self.model)
+        base_url = self._get_openai_base_url()
+
+        # Use OpenAI SDK pointed at the local server
+        client = openai_module.AsyncOpenAI(api_key="local", base_url=base_url)
+
+        # Convert MCP tools to OpenAI function calling format
+        tool_definitions, tool_callables = _convert_mcp_tools_to_functions(mcp_config)
+        print(f"[OllamaProvider] model={model}, url={base_url}, tools={len(tool_definitions)}", file=sys.stderr)
+
+        output_parts = []
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        messages = [{"role": "user", "content": prompt}]
+
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                for iteration in range(self.max_tool_iterations + 1):
+                    kwargs = {"model": model, "messages": messages}
+                    if tool_definitions and iteration < self.max_tool_iterations:
+                        kwargs["tools"] = tool_definitions
+
+                    try:
+                        response = await client.chat.completions.create(**kwargs)
+                    except openai_module.APIConnectionError:
+                        raw_url = os.environ.get("OLLAMA_URL", self.base_url)
+                        raise RuntimeError(f"Cannot connect to local server at {raw_url}. Is it running?")
+
+                    choice = response.choices[0]
+                    message = choice.message
+
+                    # Track tokens
+                    if response.usage:
+                        total_input_tokens += response.usage.prompt_tokens or 0
+                        total_output_tokens += response.usage.completion_tokens or 0
+
+                    # Capture text content
+                    if message.content:
+                        output_parts.append({"type": "text", "text": message.content})
+
+                    # Check for tool calls
+                    if not message.tool_calls:
+                        break  # Done
+
+                    messages.append(message.model_dump())
+
+                    for tool_call in message.tool_calls:
+                        fn_name = tool_call.function.name
+                        try:
+                            parsed_input = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+                        except (json.JSONDecodeError, TypeError):
+                            parsed_input = {"raw": tool_call.function.arguments}
+                        output_parts.append({
+                            "type": "tool_use",
+                            "id": tool_call.id,
+                            "name": fn_name,
+                            "input": parsed_input,
+                        })
+
+                        # Execute the tool
+                        tool_result = ""
+                        is_error = False
+                        if fn_name in tool_callables:
+                            try:
+                                args = json.loads(tool_call.function.arguments) if isinstance(tool_call.function.arguments, str) else tool_call.function.arguments
+                                func = tool_callables[fn_name]
+                                if asyncio.iscoroutinefunction(func):
+                                    result = await func(**args)
+                                else:
+                                    result = func(**args)
+                                tool_result = str(result) if result is not None else ""
+                            except Exception as e:
+                                tool_result = f"Error: {e}"
+                                is_error = True
+                        else:
+                            tool_result = f"Tool '{fn_name}' not found"
+                            is_error = True
+
+                        output_parts.append({
+                            "type": "tool_result",
+                            "tool_use_id": tool_call.id,
+                            "content": tool_result[:10000],
+                            "is_error": is_error,
+                        })
+
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": tool_result[:10000],
+                        })
+
+                        print(f"[OllamaProvider] Tool {fn_name}: {'error' if is_error else 'ok'}", file=sys.stderr)
+
+                    if on_progress:
+                        on_progress(output_parts)
+
+        except asyncio.TimeoutError:
+            raise Exception(f"Timeout after {timeout_seconds // 60} minutes")
+
+        # Local inference — zero cost
+        return ProviderResult(
+            output_parts=output_parts,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            cost_usd=0.0,
+            model=model,
+        )
+
+    def get_pricing(self) -> dict[str, dict[str, float]]:
+        return {"default": {"input": 0.0, "output": 0.0}}
+
+    def is_available(self) -> bool:
+        """Check if the local server is reachable"""
+        try:
+            raw_url = os.environ.get("OLLAMA_URL", self.base_url).rstrip("/")
+            # Try OpenAI-compatible /v1/models endpoint first
+            resp = requests.get(f"{raw_url}/v1/models", timeout=2)
+            if resp.status_code == 200:
+                return True
+            # Fall back to Ollama-native /api/tags
+            resp = requests.get(f"{raw_url}/api/tags", timeout=2)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def get_capabilities(self) -> dict:
+        return {"streaming": True, "mcp_tools": True, "tool_use": True}
+
+
+def init_providers():
+    """Register available providers at startup"""
+    providers_to_check = [
+        ("claude", ClaudeProvider()),
+        ("openai", OpenAIProvider()),
+        ("ollama", OllamaProvider()),
+    ]
+    for name, provider in providers_to_check:
+        try:
+            if provider.is_available():
+                PROVIDERS[name] = provider
+                print(f"[startup] Provider '{name}' registered", file=sys.stderr)
+            else:
+                print(f"[startup] Provider '{name}' not available (missing deps or config)", file=sys.stderr)
+        except Exception as e:
+            print(f"[startup] Provider '{name}' check failed: {e}", file=sys.stderr)
+
+
+def _get_default_provider() -> str:
+    """Get the default provider name. Checks DB setting, then falls back to first available."""
+    try:
+        conn = get_db()
+        row = conn.execute("SELECT value FROM settings WHERE key = 'default_provider'").fetchone()
+        conn.close()
+        if row:
+            provider_name = json.loads(row['value'])
+            if provider_name in PROVIDERS:
+                return provider_name
+    except Exception:
+        pass
+    # Fall back to first available provider (claude preferred)
+    for name in ["claude", "openai", "ollama"]:
+        if name in PROVIDERS:
+            return name
+    return "claude"  # Ultimate fallback
+
+
 def create_run(job: dict) -> str:
     """Create a new run record and return its ID"""
     run_id = str(uuid.uuid4())[:8]
@@ -4645,17 +5542,14 @@ def create_run(job: dict) -> str:
     conn.execute("""
         INSERT INTO runs (id, job_id, started_at, prompt, command, state)
         VALUES (?, ?, ?, ?, ?, 'pending')
-    """, (run_id, job["id"], now, job["prompt"], job["command"]))
+    """, (run_id, job["id"], now, job["prompt"], job.get("command") or "claude"))
     conn.commit()
     conn.close()
     
     return run_id
 
 async def execute_run(run_id: str):
-    """Execute a run using the Claude Agent SDK with streaming output"""
-    if not AGENT_SDK_AVAILABLE:
-        raise RuntimeError("Claude Agent SDK not installed. Run: pip install claude-agent-sdk")
-
+    """Execute a run using the configured provider (Claude, OpenAI, or Ollama)"""
     conn = get_db()
 
     # Atomically claim this run - only succeeds if state is still 'pending'
@@ -4857,180 +5751,51 @@ You are restricted to working only within the claude_playground directory.
         timeout_minutes = job["timeout_minutes"] if job else 30
         timeout_seconds = timeout_minutes * 60
 
-        # Define stderr handler to capture CLI debug output (helps diagnose MCP server issues)
-        def stderr_handler(line: str):
-            print(f"[CLI stderr] {line}", file=sys.stderr)
+        # Determine which provider to use
+        command = run["command"] or "claude"
+        provider = PROVIDERS.get(command)
+        if not provider:
+            raise RuntimeError(f"Provider '{command}' not registered. Available: {list(PROVIDERS.keys())}")
+        if not provider.is_available():
+            raise RuntimeError(f"Provider '{command}' is not available (missing dependencies or configuration)")
 
-        # Build SDK options
-        if mcp_config:
-            mcp_tool_allowlist = _discover_mcp_tool_allowlist(mcp_config)
-            if mcp_tool_allowlist:
-                allowed_tools = _merge_tool_lists(allowed_tools, mcp_tool_allowlist)
-            else:
-                print("[execute_run] No MCP tools discovered; MCP tool access may be restricted by allowed_tools", file=sys.stderr)
-            builtin_allowed_tools = _filter_builtin_tools(allowed_tools)
+        print(f"[execute_run] Using provider '{command}' for run {run_id}", file=sys.stderr)
 
-            # Debug: print actual MCP config being passed to SDK
-            for server_name, server_config in mcp_config.items():
-                cmd = server_config.get('command', 'N/A')
-                args = server_config.get('args', [])
-                env_keys = list(server_config.get('env', {}).keys())
-                print(f"[execute_run] MCP server '{server_name}': cmd={cmd}, args={args[:2]}..., env_keys={env_keys}", file=sys.stderr)
-            sdk_options = ClaudeAgentOptions(
-                tools=builtin_allowed_tools,
-                allowed_tools=allowed_tools,
-                permission_mode="bypassPermissions",  # Automated execution, no prompts
-                cwd=cwd,
-                stderr=stderr_handler,  # Capture CLI stderr for debugging
-                mcp_servers=mcp_config,
+        # Progress callback to stream output to DB
+        def on_progress(output_parts):
+            try:
+                current_output = json.dumps(output_parts)
+            except (TypeError, ValueError) as e:
+                print(f"[execute_run] JSON serialization failed: {e}", file=sys.stderr)
+                current_output = str(output_parts)
+            conn_update = get_db()
+            conn_update.execute(
+                "UPDATE runs SET output = ? WHERE id = ?",
+                (current_output, run_id)
             )
-        else:
-            builtin_allowed_tools = _filter_builtin_tools(allowed_tools)
-            sdk_options = ClaudeAgentOptions(
-                tools=builtin_allowed_tools,
-                allowed_tools=allowed_tools,
-                permission_mode="bypassPermissions",  # Automated execution, no prompts
-                cwd=cwd,
-                stderr=stderr_handler,  # Capture CLI stderr for debugging
-            )
+            conn_update.commit()
+            conn_update.close()
 
-        # Execute via Agent SDK with streaming
-        output_parts = []
-        usage = {
-            "input_tokens": 0,
-            "output_tokens": 0,
-            "total_tokens": 0,
-            "cost_usd": 0.0,
-            "model": None,
-            "cache_read_tokens": 0,
-            "cache_creation_tokens": 0,
-            "web_search_requests": 0,
-        }
-        processed_ids = set()  # Deduplicate messages (parallel tool uses share IDs)
-        final_result = None
+        # Execute via the provider
+        result = await provider.execute(
+            prompt=full_prompt,
+            cwd=cwd,
+            allowed_tools=allowed_tools,
+            mcp_config=mcp_config,
+            timeout_seconds=timeout_seconds,
+            on_progress=on_progress,
+        )
 
-        print(f"[execute_run] Starting SDK query for run {run_id} (v2 - JSON output)", file=sys.stderr)
-
-        # Use asyncio.timeout for timeout handling (Python 3.11+)
-        try:
-            async with asyncio.timeout(timeout_seconds):
-                async for message in sdk_query(prompt=full_prompt, options=sdk_options):
-                    # Capture different message types
-                    msg_type = getattr(message, 'type', None)
-                    msg_subtype = getattr(message, 'subtype', None)
-
-                    # Capture assistant messages (the actual responses)
-                    if hasattr(message, 'content') and message.content:
-                        content = message.content
-                        # Debug: log what we're receiving
-                        print(f"[execute_run] content type: {type(content).__name__}, content: {repr(content)[:200]}", file=sys.stderr)
-
-                        # Handle different content formats
-                        if isinstance(content, str):
-                            # Content is already a string - store as text block
-                            output_parts.append({"type": "text", "text": content})
-                        elif isinstance(content, list):
-                            # Content is a list of blocks - serialize each
-                            for block in content:
-                                output_parts.append(serialize_content_block(block))
-                        else:
-                            # Single block object
-                            output_parts.append(serialize_content_block(content))
-
-                    # Capture tool use and results from nested message structure
-                    if msg_type == 'assistant' and hasattr(message, 'message'):
-                        nested_content = getattr(message.message, 'content', [])
-                        if isinstance(nested_content, list):
-                            for block in nested_content:
-                                output_parts.append(serialize_content_block(block))
-
-                    # Capture token usage from system messages (deduplicate by message ID)
-                    msg_id = getattr(message, 'id', None)
-                    if hasattr(message, 'usage') and message.usage:
-                        if msg_id is None or msg_id not in processed_ids:
-                            if msg_id is not None:
-                                processed_ids.add(msg_id)
-                            u = message.usage
-                            if hasattr(u, 'input_tokens'):
-                                usage["input_tokens"] = u.input_tokens
-                            elif isinstance(u, dict):
-                                usage["input_tokens"] = u.get("input_tokens", usage["input_tokens"])
-
-                            if hasattr(u, 'output_tokens'):
-                                usage["output_tokens"] = u.output_tokens
-                            elif isinstance(u, dict):
-                                usage["output_tokens"] = u.get("output_tokens", usage["output_tokens"])
-
-                            # Capture cache token usage
-                            cache_read = getattr(u, 'cache_read_input_tokens', None) or (u.get('cache_read_input_tokens') if isinstance(u, dict) else None)
-                            if cache_read:
-                                usage["cache_read_tokens"] = cache_read
-                            cache_creation = getattr(u, 'cache_creation_input_tokens', None) or (u.get('cache_creation_input_tokens') if isinstance(u, dict) else None)
-                            if cache_creation:
-                                usage["cache_creation_tokens"] = cache_creation
-
-                    # Capture model info
-                    if hasattr(message, 'model') and message.model:
-                        usage["model"] = message.model
-
-                    # Capture authoritative cost from SDK ResultMessage
-                    if hasattr(message, 'total_cost_usd') and message.total_cost_usd:
-                        usage["cost_usd"] = message.total_cost_usd
-                    if hasattr(message, 'model_usage') and message.model_usage:
-                        # model_usage may contain per-model breakdown; extract web search count if available
-                        mu = message.model_usage
-                        if isinstance(mu, dict):
-                            for model_info in mu.values():
-                                if isinstance(model_info, dict):
-                                    usage["web_search_requests"] += model_info.get('web_search_requests', 0)
-                        elif hasattr(mu, '__iter__'):
-                            for model_info in mu:
-                                ws = getattr(model_info, 'web_search_requests', 0)
-                                if ws:
-                                    usage["web_search_requests"] += ws
-
-                    # Capture final result
-                    if hasattr(message, 'result') and message.result:
-                        final_result = message.result
-
-                    # Update DB with streaming output (every message)
-                    try:
-                        current_output = json.dumps(output_parts)
-                    except (TypeError, ValueError) as e:
-                        print(f"[execute_run] JSON serialization failed: {e}", file=sys.stderr)
-                        print(f"[execute_run] output_parts types: {[type(p).__name__ for p in output_parts]}", file=sys.stderr)
-                        # Fallback: convert to string
-                        current_output = str(output_parts)
-                    conn_update = get_db()
-                    conn_update.execute(
-                        "UPDATE runs SET output = ? WHERE id = ?",
-                        (current_output, run_id)
-                    )
-                    conn_update.commit()
-                    conn_update.close()
-
-        except asyncio.TimeoutError:
-            raise Exception(f"Timeout after {timeout_minutes} minutes")
-
-        # Build final output - add final result as a special block
-        if final_result:
+        # Build final output
+        output_parts = result.output_parts
+        if result.final_result:
             output_parts.append({
                 "type": "result",
-                "result": final_result
+                "result": result.final_result,
             })
-
         output = json.dumps(output_parts)
 
-        # Calculate total tokens
-        usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
-
-        # Only calculate cost manually if SDK didn't provide authoritative total_cost_usd
-        if usage["cost_usd"] == 0.0 and (usage["input_tokens"] > 0 or usage["output_tokens"] > 0):
-            model = usage["model"] or "default"
-            pricing = PRICING.get(model, PRICING["default"])
-            input_cost = (usage["input_tokens"] / 1_000_000) * pricing["input"]
-            output_cost = (usage["output_tokens"] / 1_000_000) * pricing["output"]
-            usage["cost_usd"] = round(input_cost + output_cost, 6)
+        total_tokens = result.input_tokens + result.output_tokens
 
         # Update run record with final output and token stats
         now = utc_now_iso()
@@ -5050,10 +5815,10 @@ You are restricted to working only within the claude_playground directory.
                 web_search_requests = ?
             WHERE id = ?
         """, (now, output, 0, "finished",
-              usage["input_tokens"], usage["output_tokens"], usage["total_tokens"],
-              usage["cost_usd"], usage["model"],
-              usage["cache_read_tokens"], usage["cache_creation_tokens"],
-              usage["web_search_requests"], run_id))
+              result.input_tokens, result.output_tokens, total_tokens,
+              result.cost_usd, result.model,
+              result.cache_read_tokens, result.cache_creation_tokens,
+              result.web_search_requests, run_id))
 
         # Update job's last_executed_at
         conn.execute("""
@@ -5065,7 +5830,7 @@ You are restricted to working only within the claude_playground directory.
 
         conn.commit()
 
-        print(f"[execute_run] Completed run {run_id}: {usage['total_tokens']} tokens, ${usage['cost_usd']:.4f}", file=sys.stderr)
+        print(f"[execute_run] Completed run {run_id} ({command}): {total_tokens} tokens, ${result.cost_usd:.4f}", file=sys.stderr)
 
     except Exception as e:
         print(f"[execute_run] Error in run {run_id}: {e}", file=sys.stderr)
@@ -5196,6 +5961,7 @@ def main():
     init_db()
     cleanup_stale_runs()
     _auto_register_fixed_servers()
+    init_providers()
     print(f"Database initialized at {DB_PATH}", file=sys.stderr)
 
     # Initialize OAuth client for Claude connector
