@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Code Runner - MCP Server with Job Scheduling
+SFLOW Agentic AI - MCP Server with Job Scheduling
 A single-file MCP server that schedules and executes AI tasks via multiple providers.
 Supports Claude (Agent SDK), OpenAI (Responses API), and Ollama (local inference).
 """
@@ -1157,7 +1157,7 @@ def ensure_oauth_client() -> tuple[str, str]:
     return client_id, client_secret
 
 # === MCP Server ===
-mcp = FastMCP("Claude Runner")
+mcp = FastMCP("SFLOW Agentic AI")
 
 # === Web Dashboard ===
 from starlette.responses import HTMLResponse, JSONResponse, Response, FileResponse
@@ -1174,7 +1174,7 @@ def check_basic_auth(request) -> Response | None:
         return Response(
             "Authentication required",
             status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="Claude Runner Dashboard"'}
+            headers={"WWW-Authenticate": 'Basic realm="SFLOW Agentic AI Dashboard"'}
         )
 
     try:
@@ -1194,7 +1194,7 @@ def check_basic_auth(request) -> Response | None:
     return Response(
         "Invalid credentials",
         status_code=401,
-        headers={"WWW-Authenticate": 'Basic realm="Claude Runner Dashboard"'}
+        headers={"WWW-Authenticate": 'Basic realm="SFLOW Agentic AI Dashboard"'}
     )
 
 def require_auth(handler):
@@ -1211,14 +1211,14 @@ DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Claude Runner Dashboard</title>
+    <title>SFLOW Agentic AI Dashboard</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
     <link rel="stylesheet" href="/static/dashboard.css">
 </head>
 <body>
     <div class="container">
-        <h1>Claude Runner Dashboard</h1>
+        <h1>SFLOW Agentic AI Dashboard</h1>
 
         <div class="cost-overview" id="cost-overview">
             <div class="cost-card highlight">

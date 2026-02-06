@@ -1,4 +1,4 @@
-# Claude Runner - MCP Server with Job Scheduling
+# SFLOW Agentic AI - MCP Server with Job Scheduling
 
 A single-file MCP server that schedules and executes AI tasks via cron expressions. Supports multiple AI providers — **Claude** (Agent SDK), **OpenAI**, and **Ollama/LM Studio** (any OpenAI-compatible local server). Features a web dashboard, webhook support, dynamic MCP server creation, and token/cost tracking.
 
@@ -56,7 +56,7 @@ Add to Claude Desktop config (`~/Library/Application Support/Claude/claude_deskt
 ```json
 {
   "mcpServers": {
-    "claude-runner": {
+    "sflow-agentic-ai": {
       "command": "/path/to/SFLOW-AIagents-MCP-Spinner/.venv/bin/python",
       "args": ["/path/to/SFLOW-AIagents-MCP-Spinner/server.py"]
     }
