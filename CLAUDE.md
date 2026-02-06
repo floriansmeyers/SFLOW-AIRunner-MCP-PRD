@@ -47,10 +47,16 @@ Jobs execute via a **provider abstraction layer**. The `command` field on jobs/r
 | **OllamaProvider** | `"ollama"` | Ollama HTTP API (`/api/chat`) | MCP tools converted to OpenAI-compatible functions |
 
 **Key classes:**
-- `BaseProvider` (ABC) - Abstract interface with `execute()`, `get_pricing()`, `is_available()`, `get_capabilities()`
+- `BaseProvider` (ABC) - Abstract interface with `execute()`, `chat()`, `get_pricing()`, `is_available()`, `get_capabilities()`
 - `ProviderResult` (dataclass) - Standardized result with `output_parts`, tokens, cost, model info
 - `PROVIDERS` (dict) - Registry populated at startup by `init_providers()`
 - `_get_default_provider()` - Returns default provider (DB setting `default_provider`, then first available)
+
+**Provider `chat()` method** (used by Admin Chat):
+- `ClaudeProvider.chat()` - Uses Anthropic Messages API directly with tool calling loop
+- `OpenAIProvider.chat()` / `OllamaProvider.chat()` - Use shared `_openai_compatible_chat()` helper
+- All implementations follow the same pattern: loop until the model stops requesting tools
+- Messages use Anthropic format (`[{role, content}]`) internally; OpenAI conversion happens in `_openai_compatible_chat()`
 
 **MCP-to-function-calling conversion** (used by OpenAI and Ollama providers):
 - `_extract_tool_schema(func)` - Builds JSON Schema from `inspect.signature()`
@@ -74,8 +80,11 @@ Jobs execute via a **provider abstraction layer**. The `command` field on jobs/r
 ├── static/             # Static assets served by the dashboard
 │   ├── dashboard.html  # Dashboard HTML (loaded at startup by _load_dashboard_html())
 │   └── dashboard.css   # Dashboard styles
-├── fixed-servers/      # Built-in MCP servers (e.g., email)
-│   └── email/
+├── fixed-servers/      # Built-in MCP servers (e.g., email, scheduler)
+│   ├── email/
+│   │   ├── server.py
+│   │   └── metadata.json
+│   └── scheduler/      # Job scheduling from within AI conversations
 │       ├── server.py
 │       └── metadata.json
 ├── dynamic_servers/    # User-created MCP servers via create_mcp_server tool
@@ -148,6 +157,7 @@ When creating dynamic servers with `create_mcp_server`, env vars can be auto-det
 
 The dashboard HTML lives in `static/dashboard.html` and is loaded once at import time into the `DASHBOARD_HTML` variable via `_load_dashboard_html()`. CSS is in `static/dashboard.css`.
 
+- **Admin Chat** (default tab) - Natural language system administration with direct tool calling
 - Cost overview (today/week/total)
 - Quick run for ad-hoc prompts with provider selection dropdown
 - Job/run/webhook management
@@ -156,14 +166,33 @@ The dashboard HTML lives in `static/dashboard.html` and is loaded once at import
 - Live run output streaming
 - Provider/model shown on run cards
 
+### Admin Chat Architecture
+
+The Admin Chat enables system configuration through natural language, calling Spinner's MCP tools directly:
+
+- **Backend**: `POST /api/admin-chat` endpoint receives `{messages, command}` (Anthropic messages format)
+- **Tool registry**: `ADMIN_TOOLS` dict maps tool names to callables; `ADMIN_TOOL_DEFINITIONS` built lazily via `_build_admin_tool_definitions()` using `_extract_tool_schema()`
+- **Provider-agnostic**: Uses `provider.chat()` method — works with Claude (Anthropic API), OpenAI, and Ollama
+- **MCP server tools**: `create_mcp_server`, `update_mcp_server`, `delete_mcp_server`, `get_dynamic_mcp_server` are included — the AI can create/modify dynamic MCP servers via natural language
+- **Frontend**: Chat history persisted in localStorage; tool calls shown as collapsible `<details>`
+
+### Scheduler Fixed Server
+
+`fixed-servers/scheduler/` provides job management tools available to AI runs via the existing MCP pipeline:
+- Tools: `create_job`, `list_jobs`, `get_job`, `update_job`, `delete_job`, `trigger_job`
+- `SCHEDULER_DB_PATH` env var is auto-configured at startup in `_auto_register_fixed_servers()`
+- Enables AI agents to schedule follow-up tasks from within a conversation
+
 ### Dashboard API Endpoints
 
 - `GET /api/providers` - Returns available providers with capabilities and default
 - `POST /api/run-prompt` - Accepts `{prompt, command}` where `command` is the provider name
+- `POST /api/admin-chat` - Admin chat with tool calling. Accepts `{messages, command}`, returns `{messages, response_text, tool_calls_made}`
 
 ## Key Dependencies
 
 - `fastmcp` - MCP protocol implementation
+- `anthropic` - Anthropic Messages API (used by ClaudeProvider.chat() for admin chat)
 - `claude-agent-sdk` - Claude provider execution engine
 - `openai` - OpenAI provider (optional, gracefully skipped if not installed)
 - `croniter` - Cron expression parsing

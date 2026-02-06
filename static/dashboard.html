@@ -56,14 +56,48 @@
         </div>
 
         <div class="tabs">
-            <button class="tab active" onclick="showTab('manual-runs')">Manual Runs</button>
+            <button class="tab active" onclick="showTab('admin-chat')">Admin</button>
+            <button class="tab" onclick="showTab('manual-runs')">Manual Runs</button>
             <button class="tab" onclick="showTab('scheduled')">Scheduled</button>
             <button class="tab" onclick="showTab('webhooks')">Webhooks</button>
             <button class="tab" onclick="showTab('tool-logs')">Tool Logs</button>
             <button class="tab" onclick="showTab('settings')">Settings</button>
         </div>
 
-        <div id="manual-runs" class="section active">
+        <div id="admin-chat" class="section active">
+            <div class="card">
+                <div class="chat-title-row">
+                    <div>
+                        <h2>Admin Chat</h2>
+                        <p style="color: var(--text-secondary); margin-bottom: 0; font-size: 13px;">Manage jobs, webhooks, servers, and credentials through natural language.</p>
+                    </div>
+                    <div class="chat-header-actions">
+                        <select id="chat-provider" class="chat-provider-select">
+                            <option value="claude">Claude</option>
+                        </select>
+                        <button class="chat-clear-btn" onclick="clearAdminChat()" title="New conversation">New Chat</button>
+                    </div>
+                </div>
+                <div class="chat-messages" id="chat-messages">
+                    <div class="chat-welcome">
+                        <h3>Welcome to Admin Chat</h3>
+                        <p>Try one of these to get started:</p>
+                        <div class="chat-suggestions">
+                            <button class="chat-suggestion" onclick="sendSuggestion('List all scheduled jobs')">List all scheduled jobs</button>
+                            <button class="chat-suggestion" onclick="sendSuggestion('Show me all webhooks')">Show me all webhooks</button>
+                            <button class="chat-suggestion" onclick="sendSuggestion('What MCP servers are available?')">What MCP servers are available?</button>
+                            <button class="chat-suggestion" onclick="sendSuggestion('Create a job that checks the weather every morning at 8am')">Create a morning weather job</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="chat-input-area">
+                    <input type="text" id="chat-input" class="chat-input" placeholder="Ask me to manage jobs, webhooks, servers..." onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendAdminMessage()}">
+                    <button class="chat-send-btn" id="chat-send-btn" onclick="sendAdminMessage()">Send</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="manual-runs" class="section">
             <div class="card">
                 <h2>Manual Runs</h2>
                 <p style="color: var(--text-secondary); margin-bottom: var(--spacing-md); font-size: 13px;">User-triggered runs from the quick run form above.</p>
@@ -295,6 +329,254 @@
             div.textContent = text;
             return div.innerHTML;
         }
+
+        // ========================================
+        // ADMIN CHAT
+        // ========================================
+        const ADMIN_CHAT_STORAGE_KEY = 'spinner_admin_chat';
+        let adminMessages = [];
+        let adminChatBusy = false;
+
+        function loadAdminChatHistory() {
+            try {
+                const stored = localStorage.getItem(ADMIN_CHAT_STORAGE_KEY);
+                if (stored) {
+                    adminMessages = JSON.parse(stored);
+                    renderAdminChat();
+                }
+            } catch (e) {
+                console.error('Failed to load chat history:', e);
+                adminMessages = [];
+            }
+        }
+
+        function saveAdminChatHistory() {
+            try {
+                localStorage.setItem(ADMIN_CHAT_STORAGE_KEY, JSON.stringify(adminMessages));
+            } catch (e) {
+                console.error('Failed to save chat history:', e);
+            }
+        }
+
+        function clearAdminChat() {
+            adminMessages = [];
+            saveAdminChatHistory();
+            const container = document.getElementById('chat-messages');
+            while (container.firstChild) container.removeChild(container.firstChild);
+            const welcome = document.createElement('div');
+            welcome.className = 'chat-welcome';
+            const h3 = document.createElement('h3');
+            h3.textContent = 'Welcome to Admin Chat';
+            welcome.appendChild(h3);
+            const p = document.createElement('p');
+            p.textContent = 'Manage your Spinner system through natural language. Try:';
+            welcome.appendChild(p);
+            const sugDiv = document.createElement('div');
+            sugDiv.className = 'chat-suggestions';
+            const suggestions = [
+                ['List all scheduled jobs', 'List all scheduled jobs'],
+                ['Show me all webhooks', 'Show me all webhooks'],
+                ['What MCP servers are available?', 'What MCP servers are available?'],
+                ['Create a morning weather job', 'Create a job that checks the weather every morning at 8am'],
+            ];
+            suggestions.forEach(([label, text]) => {
+                const btn = document.createElement('button');
+                btn.className = 'chat-suggestion';
+                btn.textContent = label;
+                btn.onclick = () => sendSuggestion(text);
+                sugDiv.appendChild(btn);
+            });
+            welcome.appendChild(sugDiv);
+            container.appendChild(welcome);
+        }
+
+        function sendSuggestion(text) {
+            document.getElementById('chat-input').value = text;
+            sendAdminMessage();
+        }
+
+        async function sendAdminMessage() {
+            const input = document.getElementById('chat-input');
+            const text = input.value.trim();
+            if (!text || adminChatBusy) return;
+
+            // Remove welcome if present
+            const welcome = document.querySelector('.chat-welcome');
+            if (welcome) welcome.remove();
+
+            // Add user message
+            adminMessages.push({ role: 'user', content: text });
+            input.value = '';
+            renderAdminChat();
+            saveAdminChatHistory();
+
+            // Show typing indicator
+            adminChatBusy = true;
+            updateChatSendButton();
+            const typingEl = document.createElement('div');
+            typingEl.className = 'chat-msg chat-msg-assistant chat-typing';
+            const typingContent = document.createElement('div');
+            typingContent.className = 'chat-msg-content';
+            const typingDots = document.createElement('div');
+            typingDots.className = 'typing-dots';
+            for (let i = 0; i < 3; i++) typingDots.appendChild(document.createElement('span'));
+            typingContent.appendChild(typingDots);
+            typingEl.appendChild(typingContent);
+            const container = document.getElementById('chat-messages');
+            container.appendChild(typingEl);
+            container.scrollTop = container.scrollHeight;
+
+            try {
+                const command = document.getElementById('chat-provider').value;
+                const res = await fetch('/api/admin-chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ messages: adminMessages, command }),
+                });
+                const data = await res.json();
+
+                if (data.error) {
+                    typingEl.remove();
+                    showToast('Chat error: ' + data.error, 'error');
+                    adminChatBusy = false;
+                    updateChatSendButton();
+                    return;
+                }
+
+                // Update messages from server response (includes tool call round-trips)
+                adminMessages = data.messages || adminMessages;
+                saveAdminChatHistory();
+                renderAdminChat(data.tool_calls_made || []);
+            } catch (e) {
+                showToast('Chat error: ' + e.message, 'error');
+            } finally {
+                typingEl.remove();
+                adminChatBusy = false;
+                updateChatSendButton();
+            }
+        }
+
+        function updateChatSendButton() {
+            const btn = document.getElementById('chat-send-btn');
+            btn.disabled = adminChatBusy;
+            btn.textContent = adminChatBusy ? 'Thinking...' : 'Send';
+        }
+
+        function renderAdminChat(toolCallsMade) {
+            const container = document.getElementById('chat-messages');
+            while (container.firstChild) container.removeChild(container.firstChild);
+
+            for (const msg of adminMessages) {
+                if (msg.role === 'user') {
+                    const content = typeof msg.content === 'string' ? msg.content : '';
+                    if (!content) continue;
+                    const msgEl = document.createElement('div');
+                    msgEl.className = 'chat-msg chat-msg-user';
+                    const bubble = document.createElement('div');
+                    bubble.className = 'chat-msg-content';
+                    bubble.textContent = content;
+                    msgEl.appendChild(bubble);
+                    container.appendChild(msgEl);
+                } else if (msg.role === 'assistant') {
+                    const content = msg.content;
+                    const msgEl = document.createElement('div');
+                    msgEl.className = 'chat-msg chat-msg-assistant';
+                    const bubble = document.createElement('div');
+                    bubble.className = 'chat-msg-content';
+
+                    if (typeof content === 'string') {
+                        const md = document.createElement('div');
+                        md.className = 'markdown-content';
+                        // renderMarkdown returns sanitized HTML from marked.js (existing pattern)
+                        md.innerHTML = renderMarkdown(content); // eslint-disable-line
+                        bubble.appendChild(md);
+                    } else if (Array.isArray(content)) {
+                        for (const block of content) {
+                            if (block.type === 'text' && block.text) {
+                                const md = document.createElement('div');
+                                md.className = 'markdown-content';
+                                md.innerHTML = renderMarkdown(block.text); // eslint-disable-line
+                                bubble.appendChild(md);
+                            } else if (block.type === 'tool_use') {
+                                const details = document.createElement('details');
+                                details.className = 'chat-tool-call';
+                                const summary = document.createElement('summary');
+                                summary.textContent = 'Tool: ' + block.name;
+                                details.appendChild(summary);
+                                const inputPre = document.createElement('pre');
+                                inputPre.textContent = JSON.stringify(block.input, null, 2);
+                                details.appendChild(inputPre);
+                                bubble.appendChild(details);
+                            }
+                        }
+                    }
+                    msgEl.appendChild(bubble);
+                    container.appendChild(msgEl);
+                }
+                // Skip tool_result messages in the UI (they are internal)
+            }
+
+            // Show tool calls summary if any were made in the last response
+            if (toolCallsMade && toolCallsMade.length > 0) {
+                const assistantMsgs = container.querySelectorAll('.chat-msg-assistant');
+                const lastAssistant = assistantMsgs[assistantMsgs.length - 1];
+                if (lastAssistant) {
+                    const bubble = lastAssistant.querySelector('.chat-msg-content');
+                    for (const tc of toolCallsMade) {
+                        const details = document.createElement('details');
+                        details.className = 'chat-tool-call';
+                        const summary = document.createElement('summary');
+                        summary.textContent = 'Called: ' + tc.name;
+                        details.appendChild(summary);
+
+                        const inputLabel = document.createElement('div');
+                        inputLabel.className = 'chat-tool-label';
+                        inputLabel.textContent = 'Input:';
+                        details.appendChild(inputLabel);
+                        const inputPre = document.createElement('pre');
+                        inputPre.textContent = JSON.stringify(tc.input, null, 2);
+                        details.appendChild(inputPre);
+
+                        const resultLabel = document.createElement('div');
+                        resultLabel.className = 'chat-tool-label';
+                        resultLabel.textContent = 'Result:';
+                        details.appendChild(resultLabel);
+                        const resultPre = document.createElement('pre');
+                        try {
+                            resultPre.textContent = JSON.stringify(JSON.parse(tc.result), null, 2);
+                        } catch {
+                            resultPre.textContent = tc.result;
+                        }
+                        details.appendChild(resultPre);
+
+                        bubble.appendChild(details);
+                    }
+                }
+            }
+
+            container.scrollTop = container.scrollHeight;
+        }
+
+        function loadChatProviders() {
+            fetch('/api/providers').then(r => r.json()).then(data => {
+                const select = document.getElementById('chat-provider');
+                if (!select || !data.providers) return;
+                while (select.firstChild) select.removeChild(select.firstChild);
+                const labels = { claude: 'Claude', openai: 'OpenAI', ollama: 'Ollama' };
+                for (const [name, info] of Object.entries(data.providers)) {
+                    if (info.available) {
+                        const opt = document.createElement('option');
+                        opt.value = name;
+                        opt.textContent = labels[name] || name;
+                        if (name === data.default) opt.selected = true;
+                        select.appendChild(opt);
+                    }
+                }
+            }).catch(e => console.error('Failed to load chat providers:', e));
+        }
+
+        loadChatProviders();
+        loadAdminChatHistory();
 
         function copyToClipboard(text) {
             navigator.clipboard.writeText(text).then(() => {

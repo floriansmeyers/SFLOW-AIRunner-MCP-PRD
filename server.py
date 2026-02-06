@@ -52,6 +52,13 @@ except ImportError:
     AGENT_SDK_AVAILABLE = False
     print("Warning: claude-agent-sdk not installed. Run: pip install claude-agent-sdk", file=sys.stderr)
 
+# Anthropic SDK for admin chat (always available via claude-agent-sdk dependency)
+try:
+    import anthropic as anthropic_module
+    ANTHROPIC_SDK_AVAILABLE = True
+except ImportError:
+    ANTHROPIC_SDK_AVAILABLE = False
+
 # OpenAI SDK for OpenAI provider
 try:
     import openai as openai_module
@@ -170,6 +177,26 @@ class BaseProvider(ABC):
     def is_available(self) -> bool:
         """Check if this provider is available (SDK installed, API key set, etc.)"""
         ...
+
+    async def chat(
+        self,
+        messages: list,
+        system_prompt: str,
+        tool_defs: list,
+        tool_callables: dict,
+    ) -> dict:
+        """Multi-turn conversation with tool calling.
+
+        Args:
+            messages: Conversation history in Anthropic format [{role, content}]
+            system_prompt: System instructions for the assistant
+            tool_defs: Tool definitions (provider-agnostic internal format)
+            tool_callables: Dict mapping tool name -> callable
+
+        Returns:
+            {messages: [...], response_text: str, tool_calls_made: [{name, input, result}]}
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support chat()")
 
     def get_capabilities(self) -> dict:
         """Return provider capabilities"""
@@ -825,6 +852,14 @@ def _auto_register_fixed_servers() -> None:
                 _add_fixed_server_to_config(name)
                 print(f"[startup] Auto-registered fixed server: {name}", file=sys.stderr)
 
+    # Auto-configure scheduler DB path so it points to our jobs.db
+    if (FIXED_SERVERS_DIR / "scheduler" / "server.py").exists():
+        db_path = str(DB_PATH.resolve())
+        existing = _get_server_credential("scheduler", "SCHEDULER_DB_PATH")
+        if existing != db_path:
+            _set_server_credential("scheduler", "SCHEDULER_DB_PATH", db_path)
+            print(f"[startup] Auto-configured scheduler DB path: {db_path}", file=sys.stderr)
+
 # === Tool Name Validation Helper ===
 
 # Built-in Claude Code tools that don't need normalization
@@ -1345,6 +1380,44 @@ async def api_run_prompt_handler(request):
         # Run will be picked up by run_processor_loop (within 5 seconds)
         return JSONResponse({"success": True, "run_id": run_id, "job_id": job_id})
     except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@require_auth
+async def api_admin_chat_handler(request):
+    """Admin chat endpoint — multi-turn conversation with direct tool calling"""
+    global ADMIN_TOOL_DEFINITIONS, ADMIN_TOOL_CALLABLES
+    try:
+        body = await request.json()
+        messages = body.get("messages", [])
+        command = body.get("command", _get_default_provider())
+
+        if not messages:
+            return JSONResponse({"error": "No messages provided"}, status_code=400)
+
+        provider = PROVIDERS.get(command)
+        if not provider:
+            available = list(PROVIDERS.keys())
+            return JSONResponse(
+                {"error": f"Provider '{command}' not available. Available: {available}"},
+                status_code=400,
+            )
+
+        # Build tool definitions and callables lazily on first call
+        if not ADMIN_TOOL_DEFINITIONS:
+            ADMIN_TOOL_DEFINITIONS = _build_admin_tool_definitions()
+            ADMIN_TOOL_CALLABLES = _build_admin_tool_callables()
+            print(f"[admin-chat] Built {len(ADMIN_TOOL_DEFINITIONS)} tool definitions", file=sys.stderr)
+
+        result = await provider.chat(
+            messages=messages,
+            system_prompt=ADMIN_SYSTEM_PROMPT,
+            tool_defs=ADMIN_TOOL_DEFINITIONS,
+            tool_callables=ADMIN_TOOL_CALLABLES,
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
         return JSONResponse({"error": str(e)}, status_code=500)
 
 @require_auth
@@ -2284,6 +2357,7 @@ dashboard_routes = [
     Route("/api/run/{run_id}", api_run_detail_handler),
     Route("/api/run/{run_id}/kill", api_kill_run_handler, methods=["POST"]),
     Route("/api/run-prompt", api_run_prompt_handler, methods=["POST"]),
+    Route("/api/admin-chat", api_admin_chat_handler, methods=["POST"]),
     Route("/api/job/{job_id}", api_get_job_handler, methods=["GET"]),
     Route("/api/job/{job_id}", api_update_job_handler, methods=["PUT"]),
     Route("/api/job/{job_id}", api_delete_job_handler, methods=["DELETE"]),
@@ -3456,6 +3530,160 @@ def _convert_mcp_tools_to_functions(mcp_config: dict) -> tuple[list[dict], dict]
     return tool_definitions, tool_callables
 
 
+async def _openai_compatible_chat(messages, system_prompt, tool_defs, tool_callables,
+                                   client_factory, model) -> dict:
+    """Shared chat implementation for OpenAI-compatible APIs (OpenAI + Ollama)."""
+    if not OPENAI_SDK_AVAILABLE:
+        raise RuntimeError("OpenAI SDK not installed. Run: pip install openai")
+
+    client = client_factory()
+
+    # Convert tool_defs to OpenAI format
+    openai_tools = []
+    for td in tool_defs:
+        openai_tools.append({
+            "type": "function",
+            "function": {
+                "name": td["name"],
+                "description": td.get("description", "")[:1024],
+                "parameters": td["parameters"],
+            }
+        })
+
+    # Prepend system message
+    api_messages = [{"role": "system", "content": system_prompt}]
+    # Convert messages from Anthropic format to OpenAI format
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            api_messages.append({"role": role, "content": content})
+        elif isinstance(content, list):
+            if role == "assistant":
+                # Assistant messages may contain text + tool_use blocks
+                text_parts = []
+                tool_calls_list = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block["text"])
+                    elif isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_calls_list.append({
+                            "id": block.get("id", ""),
+                            "type": "function",
+                            "function": {
+                                "name": block["name"],
+                                "arguments": json.dumps(block.get("input", {})),
+                            }
+                        })
+                assistant_msg = {"role": "assistant", "content": "\n".join(text_parts) if text_parts else None}
+                if tool_calls_list:
+                    assistant_msg["tool_calls"] = tool_calls_list
+                api_messages.append(assistant_msg)
+            else:
+                # User messages with tool_result blocks
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_result":
+                        api_messages.append({
+                            "role": "tool",
+                            "tool_call_id": block["tool_use_id"],
+                            "content": str(block.get("content", "")),
+                        })
+                    elif isinstance(block, dict) and block.get("type") == "text":
+                        api_messages.append({"role": role, "content": block["text"]})
+                    else:
+                        api_messages.append({"role": role, "content": str(block)})
+
+    tool_calls_made = []
+    response_text = ""
+    max_iterations = 25
+
+    for _ in range(max_iterations):
+        kwargs = {"model": model, "messages": api_messages}
+        if openai_tools:
+            kwargs["tools"] = openai_tools
+
+        response = await client.chat.completions.create(**kwargs)
+        choice = response.choices[0]
+        message = choice.message
+
+        if message.content:
+            response_text += message.content
+
+        if not message.tool_calls:
+            # Append final assistant message to conversation in Anthropic format
+            messages.append({"role": "assistant", "content": response_text})
+            break
+
+        # Build assistant content in Anthropic format
+        assistant_content = []
+        if message.content:
+            assistant_content.append({"type": "text", "text": message.content})
+
+        # Process tool calls
+        api_messages.append(message.model_dump())
+        tool_results_anthropic = []
+
+        for tool_call in message.tool_calls:
+            fn_name = tool_call.function.name
+            try:
+                fn_input = json.loads(tool_call.function.arguments) if tool_call.function.arguments else {}
+            except (json.JSONDecodeError, TypeError):
+                fn_input = {}
+
+            assistant_content.append({
+                "type": "tool_use",
+                "id": tool_call.id,
+                "name": fn_name,
+                "input": fn_input,
+            })
+
+            result_str = ""
+            is_error = False
+            if fn_name in tool_callables:
+                try:
+                    func = tool_callables[fn_name]
+                    if asyncio.iscoroutinefunction(func):
+                        result = await func(**fn_input)
+                    else:
+                        result = func(**fn_input)
+                    result_str = str(result) if result is not None else ""
+                except Exception as e:
+                    result_str = f"Error: {e}"
+                    is_error = True
+            else:
+                result_str = f"Tool '{fn_name}' not available"
+                is_error = True
+
+            tool_calls_made.append({
+                "name": fn_name,
+                "input": fn_input,
+                "result": result_str[:5000],
+            })
+
+            api_messages.append({
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": result_str[:10000],
+            })
+            tool_results_anthropic.append({
+                "type": "tool_result",
+                "tool_use_id": tool_call.id,
+                "content": result_str[:10000],
+                "is_error": is_error,
+            })
+
+        messages.append({"role": "assistant", "content": assistant_content})
+        messages.append({"role": "user", "content": tool_results_anthropic})
+
+    await client.close()
+
+    return {
+        "messages": messages,
+        "response_text": response_text,
+        "tool_calls_made": tool_calls_made,
+    }
+
+
 class ClaudeProvider(BaseProvider):
     """Provider that executes via the Claude Agent SDK (Claude Code CLI)"""
 
@@ -3614,6 +3842,104 @@ class ClaudeProvider(BaseProvider):
     def is_available(self) -> bool:
         return AGENT_SDK_AVAILABLE
 
+    async def chat(self, messages, system_prompt, tool_defs, tool_callables) -> dict:
+        if not ANTHROPIC_SDK_AVAILABLE:
+            raise RuntimeError("Anthropic SDK not installed. Run: pip install anthropic")
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            raise RuntimeError("ANTHROPIC_API_KEY not set. Required for Claude admin chat.")
+
+        client = anthropic_module.Anthropic()
+        model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5-20250514")
+
+        # Convert tool_defs to Anthropic format
+        anthropic_tools = []
+        for td in tool_defs:
+            anthropic_tools.append({
+                "name": td["name"],
+                "description": td.get("description", ""),
+                "input_schema": td["parameters"],
+            })
+
+        tool_calls_made = []
+        max_iterations = 25
+
+        for _ in range(max_iterations):
+            response = client.messages.create(
+                model=model,
+                max_tokens=4096,
+                system=system_prompt,
+                tools=anthropic_tools if anthropic_tools else [],
+                messages=messages,
+            )
+
+            # Build assistant message content
+            assistant_content = []
+            response_text = ""
+            has_tool_use = False
+
+            for block in response.content:
+                if block.type == "text":
+                    response_text += block.text
+                    assistant_content.append({"type": "text", "text": block.text})
+                elif block.type == "tool_use":
+                    has_tool_use = True
+                    assistant_content.append({
+                        "type": "tool_use",
+                        "id": block.id,
+                        "name": block.name,
+                        "input": block.input,
+                    })
+
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            if response.stop_reason != "tool_use" or not has_tool_use:
+                break
+
+            # Execute tool calls and append results
+            tool_results = []
+            for block in response.content:
+                if block.type != "tool_use":
+                    continue
+                fn_name = block.name
+                fn_input = block.input or {}
+                result_str = ""
+                is_error = False
+
+                if fn_name in tool_callables:
+                    try:
+                        func = tool_callables[fn_name]
+                        if asyncio.iscoroutinefunction(func):
+                            result = await func(**fn_input)
+                        else:
+                            result = func(**fn_input)
+                        result_str = str(result) if result is not None else ""
+                    except Exception as e:
+                        result_str = f"Error: {e}"
+                        is_error = True
+                else:
+                    result_str = f"Tool '{fn_name}' not available"
+                    is_error = True
+
+                tool_calls_made.append({
+                    "name": fn_name,
+                    "input": fn_input,
+                    "result": result_str[:5000],
+                })
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_str[:10000],
+                    "is_error": is_error,
+                })
+
+            messages.append({"role": "user", "content": tool_results})
+
+        return {
+            "messages": messages,
+            "response_text": response_text,
+            "tool_calls_made": tool_calls_made,
+        }
+
     def get_capabilities(self) -> dict:
         return {"streaming": True, "mcp_tools": True, "tool_use": True}
 
@@ -3747,6 +4073,16 @@ class OpenAIProvider(BaseProvider):
 
     def is_available(self) -> bool:
         return OPENAI_SDK_AVAILABLE and bool(os.environ.get("OPENAI_API_KEY"))
+
+    async def chat(self, messages, system_prompt, tool_defs, tool_callables) -> dict:
+        return await _openai_compatible_chat(
+            messages=messages,
+            system_prompt=system_prompt,
+            tool_defs=tool_defs,
+            tool_callables=tool_callables,
+            client_factory=lambda: openai_module.AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY")),
+            model=os.environ.get("OPENAI_MODEL", self.model),
+        )
 
     def get_capabilities(self) -> dict:
         return {"streaming": True, "mcp_tools": True, "tool_use": True}
@@ -3898,8 +4234,148 @@ class OllamaProvider(BaseProvider):
         except Exception:
             return False
 
+    async def chat(self, messages, system_prompt, tool_defs, tool_callables) -> dict:
+        base_url = self._get_openai_base_url()
+        return await _openai_compatible_chat(
+            messages=messages,
+            system_prompt=system_prompt,
+            tool_defs=tool_defs,
+            tool_callables=tool_callables,
+            client_factory=lambda: openai_module.AsyncOpenAI(api_key="local", base_url=base_url),
+            model=os.environ.get("OLLAMA_MODEL", self.model),
+        )
+
     def get_capabilities(self) -> dict:
         return {"streaming": True, "mcp_tools": True, "tool_use": True}
+
+
+# === Admin Chat Configuration ===
+
+ADMIN_SYSTEM_PROMPT = """You are an AI assistant managing the SFLOW Agentic AI Spinner system. You help administrators configure and manage scheduled jobs, webhooks, MCP servers, and credentials through natural language.
+
+Available capabilities:
+- **Jobs**: List, create, update, delete, and trigger scheduled AI jobs
+- **Runs**: View run history and kill running tasks
+- **Webhooks**: Create, list, update, and delete webhook endpoints
+- **MCP Servers**: List, enable/disable, create, update, and delete dynamic MCP servers
+- **Credentials**: Configure server credentials and check configuration status
+
+Guidelines:
+- Always explain what you're about to do before calling a tool
+- For destructive operations (delete, disable), confirm the target name/ID with the user
+- When creating jobs, validate cron expressions and suggest common patterns
+- Show results in a clear, readable format
+- If a tool returns an error, explain what went wrong and suggest a fix
+
+When creating MCP servers with `create_mcp_server`, write the code following this pattern:
+- Use `from fastmcp import FastMCP` and `mcp = FastMCP("Server Name")`
+- Define tools with `@mcp.tool()` decorator
+- Use `httpx` (async) for HTTP calls
+- Use `os.environ.get("VAR_NAME")` for any credentials so they are auto-detected
+- Do NOT import or define `DATA_DIR` — it is auto-injected at the top of the file
+- Always end with `if __name__ == "__main__": mcp.run()`
+
+Example server code:
+```python
+from fastmcp import FastMCP
+import httpx
+
+mcp = FastMCP("My API")
+
+@mcp.tool()
+async def fetch_data(query: str) -> dict:
+    \"\"\"Fetch data from the API.\"\"\"
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"https://api.example.com/data?q={query}")
+        response.raise_for_status()
+        return response.json()
+
+if __name__ == "__main__":
+    mcp.run()
+```
+"""
+
+ADMIN_TOOLS = {
+    "list_jobs": list_jobs,
+    "create_job": create_job,
+    "update_job": update_job,
+    "delete_job": delete_job,
+    "trigger_job": trigger_job,
+    "get_job": get_job,
+    "list_runs": list_runs,
+    "get_run": get_run,
+    "kill_run": kill_run,
+    "list_webhooks": list_webhooks,
+    "create_webhook": create_webhook,
+    "update_webhook": update_webhook,
+    "delete_webhook": delete_webhook,
+    "get_webhook": get_webhook,
+    "list_fixed_mcp_servers": list_fixed_mcp_servers,
+    "list_dynamic_mcp_servers": list_dynamic_mcp_servers,
+    "enable_fixed_server": enable_fixed_server,
+    "disable_fixed_server": disable_fixed_server,
+    "enable_mcp_server": enable_mcp_server,
+    "disable_mcp_server": disable_mcp_server,
+    "set_server_credential": set_server_credential,
+    "get_server_credentials": get_server_credentials,
+    "list_required_credentials": list_required_credentials,
+    "get_unconfigured_servers": get_unconfigured_servers,
+    "invoke_internal_mcp_tool": invoke_internal_mcp_tool,
+    "create_mcp_server": create_mcp_server,
+    "update_mcp_server": update_mcp_server,
+    "delete_mcp_server": delete_mcp_server,
+    "get_dynamic_mcp_server": get_dynamic_mcp_server,
+}
+
+def _unwrap_mcp_tool(func):
+    """Unwrap a FastMCP FunctionTool to get the original callable, or return as-is."""
+    # FastMCP's @mcp.tool() returns FunctionTool objects with .fn attribute
+    if hasattr(func, 'fn') and callable(getattr(func, 'fn')):
+        return func.fn
+    # Standard functools.wraps pattern
+    while hasattr(func, '__wrapped__'):
+        func = func.__wrapped__
+    return func
+
+
+def _build_admin_tool_definitions() -> list:
+    """Build tool definitions from ADMIN_TOOLS using function signatures and docstrings."""
+    definitions = []
+    for name, func in ADMIN_TOOLS.items():
+        try:
+            # FunctionTool has .parameters and .description built-in
+            if hasattr(func, 'parameters') and hasattr(func, 'description'):
+                schema = func.parameters
+                description = (func.description or f"Tool: {name}").strip()
+            else:
+                original = _unwrap_mcp_tool(func)
+                schema = _extract_tool_schema(original)
+                description = (original.__doc__ or f"Tool: {name}").strip()
+
+            if len(description) > 1024:
+                description = description[:1021] + "..."
+
+            definitions.append({
+                "name": name,
+                "description": description,
+                "parameters": schema,
+            })
+        except Exception as e:
+            print(f"[admin-chat] Failed to build definition for '{name}': {e}", file=sys.stderr)
+    return definitions
+
+
+def _build_admin_tool_callables() -> dict:
+    """Build a dict of actual callables from ADMIN_TOOLS (unwrapping FunctionTool objects)."""
+    callables = {}
+    for name, func in ADMIN_TOOLS.items():
+        callables[name] = _unwrap_mcp_tool(func)
+    return callables
+
+
+# Built lazily on first use (after @mcp.tool decorators have run)
+ADMIN_TOOL_DEFINITIONS: list = []
+ADMIN_TOOL_CALLABLES: dict = {}
 
 
 def init_providers():
