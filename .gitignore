@@ -22,3 +22,4 @@ venv/
 
 # Local Claude settings
 .claude/settings.local.json
+/dynamic_servers
