@@ -71,6 +71,9 @@ Jobs execute via a **provider abstraction layer**. The `command` field on jobs/r
 ```
 ├── server.py           # Main MCP server
 ├── jobs.db             # SQLite database
+├── static/             # Static assets served by the dashboard
+│   ├── dashboard.html  # Dashboard HTML (loaded at startup by _load_dashboard_html())
+│   └── dashboard.css   # Dashboard styles
 ├── fixed-servers/      # Built-in MCP servers (e.g., email)
 │   └── email/
 │       ├── server.py
@@ -142,6 +145,8 @@ Use MCP tools to manage credentials:
 When creating dynamic servers with `create_mcp_server`, env vars can be auto-detected from code patterns like `os.environ.get("VAR_NAME")`.
 
 ## Web Dashboard (SSE mode only)
+
+The dashboard HTML lives in `static/dashboard.html` and is loaded once at import time into the `DASHBOARD_HTML` variable via `_load_dashboard_html()`. CSS is in `static/dashboard.css`.
 
 - Cost overview (today/week/total)
 - Quick run for ad-hoc prompts with provider selection dropdown
