@@ -128,7 +128,7 @@
                 <div class="table-wrapper">
                     <table>
                         <thead>
-                            <tr><th>ID</th><th>Name</th><th>Cron</th><th>Status</th><th>Workspace</th><th>Last Run</th><th>Prompt</th><th>Actions</th></tr>
+                            <tr><th>Name</th><th>Schedule</th><th>Provider</th><th>Workspace</th><th>Last Run</th><th style="text-align:right">Actions</th></tr>
                         </thead>
                         <tbody id="jobs-table"></tbody>
                     </table>
@@ -154,7 +154,7 @@
                 <div class="table-wrapper">
                     <table>
                         <thead>
-                            <tr><th>Name</th><th>URL</th><th>Provider</th><th>Workspace</th><th>Triggers</th><th>Last Triggered</th><th>Status</th><th>Actions</th></tr>
+                            <tr><th>Name</th><th>URL</th><th>Provider</th><th>Workspace</th><th>Triggers</th><th>Last Triggered</th><th style="text-align:right">Actions</th></tr>
                         </thead>
                         <tbody id="webhooks-table"></tbody>
                     </table>
@@ -790,6 +790,197 @@
             });
         }
 
+        function renderScheduledJobsTable(jobs) {
+            const table = document.getElementById('jobs-table');
+            table.innerHTML = '';
+            if (jobs.length === 0) {
+                table.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--text-muted); padding: var(--spacing-lg);">No scheduled jobs. Create one using the MCP tool or Admin Chat.</td></tr>';
+                return;
+            }
+            const wsOptions = workspacesData.map(w => '<option value="' + escapeHtml(w.id) + '">' + escapeHtml(w.name) + '</option>').join('');
+            jobs.forEach(j => {
+                const tr = document.createElement('tr');
+
+                // Name + toggle
+                const nameCell = document.createElement('td');
+                const toggle = document.createElement('label');
+                toggle.className = 'toggle-switch';
+                toggle.title = j.enabled ? 'Enabled — click to disable' : 'Disabled — click to enable';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.checked = j.enabled;
+                cb.onchange = function() { updateJobField(j.id, 'enabled', this.checked); };
+                const slider = document.createElement('span');
+                slider.className = 'slider';
+                toggle.appendChild(cb);
+                toggle.appendChild(slider);
+                nameCell.appendChild(toggle);
+                const nameSpan = document.createElement('strong');
+                nameSpan.style.cssText = 'color: var(--text-primary); margin-left: 8px; cursor: pointer;';
+                nameSpan.textContent = j.name;
+                nameSpan.title = 'Click to view details';
+                nameSpan.onclick = function() { showJobDetail(j.id); };
+                nameCell.appendChild(nameSpan);
+                tr.appendChild(nameCell);
+
+                // Schedule
+                const cronCell = document.createElement('td');
+                const cronBadge = document.createElement('span');
+                cronBadge.className = 'cron';
+                cronBadge.textContent = j.cron;
+                cronCell.appendChild(cronBadge);
+                tr.appendChild(cronCell);
+
+                // Provider dropdown
+                const provCell = document.createElement('td');
+                const provSelect = document.createElement('select');
+                provSelect.className = 'inline-select';
+                const providerLabels = { claude: 'Claude', openai: 'OpenAI', ollama: 'Ollama' };
+                Object.keys(providerLabels).forEach(function(p) {
+                    const opt = document.createElement('option');
+                    opt.value = p;
+                    opt.textContent = providerLabels[p];
+                    if (p === (j.command || 'claude')) opt.selected = true;
+                    provSelect.appendChild(opt);
+                });
+                provSelect.onchange = function() { updateJobField(j.id, 'command', this.value); };
+                provCell.appendChild(provSelect);
+                tr.appendChild(provCell);
+
+                // Workspace dropdown
+                const wsCell = document.createElement('td');
+                const wsSelect = document.createElement('select');
+                wsSelect.className = 'inline-select';
+                wsSelect.innerHTML = '<option value="">Default</option>' + wsOptions;
+                wsSelect.value = j.workspace_id || '';
+                wsSelect.onchange = function() { updateJobField(j.id, 'workspace_id', this.value); };
+                wsCell.appendChild(wsSelect);
+                tr.appendChild(wsCell);
+
+                // Last run
+                const lastCell = document.createElement('td');
+                lastCell.style.color = 'var(--text-secondary)';
+                lastCell.style.fontSize = '12px';
+                lastCell.textContent = j.last_executed_at ? new Date(j.last_executed_at).toLocaleString() : 'Never';
+                tr.appendChild(lastCell);
+
+                // Actions
+                const actCell = document.createElement('td');
+                actCell.style.textAlign = 'right';
+                const group = document.createElement('div');
+                group.className = 'action-group';
+
+                const viewBtn = document.createElement('button');
+                viewBtn.className = 'action-btn';
+                viewBtn.textContent = 'Edit';
+                viewBtn.onclick = function() { showJobDetail(j.id); };
+                group.appendChild(viewBtn);
+
+                const trigBtn = document.createElement('button');
+                trigBtn.className = 'action-btn action-btn--primary';
+                trigBtn.textContent = 'Trigger';
+                trigBtn.onclick = function() { triggerJob(j.id); };
+                group.appendChild(trigBtn);
+
+                const delBtn = document.createElement('button');
+                delBtn.className = 'action-btn action-btn--danger';
+                delBtn.textContent = 'Delete';
+                delBtn.onclick = function() { deleteJob(j.id, j.name); };
+                group.appendChild(delBtn);
+
+                actCell.appendChild(group);
+                tr.appendChild(actCell);
+
+                table.appendChild(tr);
+            });
+        }
+
+        async function updateJobField(jobId, field, value) {
+            try {
+                const body = {};
+                body[field] = value;
+                const res = await fetch('/api/job/' + jobId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                if (data.error) {
+                    showToast('Error: ' + data.error, 'error');
+                } else {
+                    showToast('Job updated', 'success');
+                    refresh();
+                }
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function triggerJob(jobId) {
+            try {
+                const res = await fetch('/api/job/' + jobId + '/trigger', { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    showToast('Job triggered — run ' + data.run_id, 'success');
+                    refresh();
+                } else {
+                    showToast('Error: ' + (data.error || 'Unknown'), 'error');
+                }
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        function showJobDetail(jobId) {
+            const job = jobsData.find(j => j.id === jobId);
+            if (!job) return;
+            const providerLabels = { claude: 'Claude', openai: 'OpenAI', ollama: 'Ollama' };
+            const wsName = job.workspace_id ? (workspacesData.find(w => w.id === job.workspace_id) || {}).name || '' : 'Default';
+            document.getElementById('modal-title').textContent = job.name;
+            const body = document.getElementById('modal-body');
+            body.innerHTML = '';
+
+            // Meta row
+            const meta = document.createElement('div');
+            meta.style.cssText = 'display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px;';
+            meta.innerHTML =
+                '<span class="status ' + (job.enabled ? 'enabled' : 'disabled') + '">' + (job.enabled ? 'Enabled' : 'Disabled') + '</span>' +
+                '<span class="cron">' + escapeHtml(job.cron) + '</span>' +
+                '<span class="status badge-workspace">' + escapeHtml(wsName) + '</span>' +
+                '<span style="color:var(--text-muted);font-size:12px;">ID: ' + escapeHtml(job.id) + '</span>';
+            body.appendChild(meta);
+
+            // Prompt editor
+            const promptSection = document.createElement('div');
+            promptSection.className = 'modal-section';
+            const promptLabel = document.createElement('h4');
+            promptLabel.textContent = 'Prompt';
+            promptSection.appendChild(promptLabel);
+            const textarea = document.createElement('textarea');
+            textarea.id = 'job-prompt-edit';
+            textarea.value = job.prompt;
+            textarea.style.cssText = 'width: 100%; min-height: 200px; background: var(--bg-tertiary); color: var(--text-primary); border: 1px solid var(--border-default); padding: 12px; font-family: monospace; font-size: 13px; resize: vertical; box-sizing: border-box;';
+            promptSection.appendChild(textarea);
+            body.appendChild(promptSection);
+
+            // Save button
+            const actions = document.createElement('div');
+            actions.style.cssText = 'display: flex; gap: 8px; margin-top: 12px;';
+            const saveBtn = document.createElement('button');
+            saveBtn.className = 'refresh-btn';
+            saveBtn.style.cssText = 'min-height: 36px; padding: 8px 20px; font-size: 12px;';
+            saveBtn.textContent = 'Save Prompt';
+            saveBtn.onclick = async function() {
+                const newPrompt = document.getElementById('job-prompt-edit').value;
+                await updateJobField(jobId, 'prompt', newPrompt);
+                closeModal();
+            };
+            actions.appendChild(saveBtn);
+            body.appendChild(actions);
+
+            document.getElementById('output-modal').classList.add('active');
+        }
+
         function deleteJob(jobId, jobName) {
             showConfirm('Delete Job', `Are you sure you want to delete "${jobName}"? This will also delete all associated runs.`, async () => {
                 try {
@@ -827,15 +1018,14 @@
 
         function renderWebhooksTable(webhooks) {
             const table = document.getElementById('webhooks-table');
-            // Clear safely
             while (table.firstChild) table.removeChild(table.firstChild);
 
             if (webhooks.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 8;
+                cell.colSpan = 7;
                 cell.style.cssText = 'text-align: center; color: var(--text-muted); padding: var(--spacing-lg);';
-                cell.textContent = 'No webhooks configured. Create one using the MCP tool.';
+                cell.textContent = 'No webhooks configured. Create one using the MCP tool or Admin Chat.';
                 row.appendChild(cell);
                 table.appendChild(row);
                 return;
@@ -843,43 +1033,52 @@
 
             const providerLabels = { claude: 'Claude', openai: 'OpenAI', ollama: 'Ollama' };
             const availableProviders = Object.keys(providerLabels);
+            const wsOptions = workspacesData.map(w => '<option value="' + escapeHtml(w.id) + '">' + escapeHtml(w.name) + '</option>').join('');
 
             webhooks.forEach(w => {
                 const row = document.createElement('tr');
 
-                // Name
+                // Name + toggle
                 const nameCell = document.createElement('td');
+                const toggle = document.createElement('label');
+                toggle.className = 'toggle-switch';
+                toggle.title = w.enabled ? 'Active — click to disable' : 'Disabled — click to enable';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.checked = w.enabled;
+                cb.onchange = function() { updateWebhookField(w.id, 'enabled', this.checked); };
+                const slider = document.createElement('span');
+                slider.className = 'slider';
+                toggle.appendChild(cb);
+                toggle.appendChild(slider);
+                nameCell.appendChild(toggle);
                 const nameStrong = document.createElement('strong');
-                nameStrong.style.color = 'var(--text-primary)';
+                nameStrong.style.cssText = 'color: var(--text-primary); margin-left: 8px;';
                 nameStrong.textContent = w.name;
                 nameCell.appendChild(nameStrong);
                 if (w.description) {
                     nameCell.appendChild(document.createElement('br'));
                     const desc = document.createElement('small');
-                    desc.style.color = 'var(--text-muted)';
+                    desc.style.cssText = 'color: var(--text-muted); margin-left: 42px;';
                     desc.textContent = w.description;
                     nameCell.appendChild(desc);
                 }
                 row.appendChild(nameCell);
 
-                // URL
+                // URL (compact)
                 const urlCell = document.createElement('td');
                 const urlCode = document.createElement('code');
-                urlCode.style.cssText = 'font-size: 11px; word-break: break-all; color: var(--accent-cyan);';
-                urlCode.textContent = w.url;
+                urlCode.style.cssText = 'font-size: 11px; word-break: break-all; color: var(--accent-cyan); cursor: pointer;';
+                urlCode.textContent = w.url.replace(/^https?:\/\/[^/]+/, '...');
+                urlCode.title = w.url + '\nClick to copy';
+                urlCode.onclick = function() { copyToClipboard(w.url); };
                 urlCell.appendChild(urlCode);
-                const copyBtn = document.createElement('button');
-                copyBtn.className = 'view-btn';
-                copyBtn.style.marginLeft = '8px';
-                copyBtn.textContent = 'Copy';
-                copyBtn.onclick = () => copyToClipboard(w.url);
-                urlCell.appendChild(copyBtn);
                 row.appendChild(urlCell);
 
                 // Provider dropdown
                 const providerCell = document.createElement('td');
                 const select = document.createElement('select');
-                select.style.cssText = 'padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg-secondary); color: var(--text-primary); font-size: 12px; cursor: pointer;';
+                select.className = 'inline-select';
                 availableProviders.forEach(p => {
                     const opt = document.createElement('option');
                     opt.value = p;
@@ -887,78 +1086,99 @@
                     if (p === (w.command || 'claude')) opt.selected = true;
                     select.appendChild(opt);
                 });
-                select.onchange = () => updateWebhookProvider(w.id, select.value);
+                select.onchange = function() { updateWebhookField(w.id, 'command', this.value); };
                 providerCell.appendChild(select);
                 row.appendChild(providerCell);
 
-                // Workspace
+                // Workspace dropdown
                 const wsCell = document.createElement('td');
-                const wsName = w.workspace_id ? (workspacesData.find(ws => ws.id === w.workspace_id) || {}).name || w.workspace_id : '';
-                if (wsName) {
-                    const wsBadge = document.createElement('span');
-                    wsBadge.className = 'badge badge-workspace';
-                    wsBadge.textContent = wsName;
-                    wsCell.appendChild(wsBadge);
-                } else {
-                    wsCell.style.color = 'var(--text-muted)';
-                    wsCell.textContent = '—';
-                }
+                const wsSelect = document.createElement('select');
+                wsSelect.className = 'inline-select';
+                wsSelect.innerHTML = '<option value="">Default</option>' + wsOptions;
+                wsSelect.value = w.workspace_id || '';
+                wsSelect.onchange = function() { updateWebhookField(w.id, 'workspace_id', this.value); };
+                wsCell.appendChild(wsSelect);
                 row.appendChild(wsCell);
 
                 // Triggers
                 const triggersCell = document.createElement('td');
+                triggersCell.style.cssText = 'text-align: center; font-variant-numeric: tabular-nums;';
                 triggersCell.textContent = w.trigger_count;
                 row.appendChild(triggersCell);
 
                 // Last triggered
                 const lastCell = document.createElement('td');
-                lastCell.style.color = 'var(--text-secondary)';
+                lastCell.style.cssText = 'color: var(--text-secondary); font-size: 12px;';
                 lastCell.textContent = w.last_triggered_at ? new Date(w.last_triggered_at).toLocaleString() : 'Never';
                 row.appendChild(lastCell);
 
-                // Status
-                const statusCell = document.createElement('td');
-                const statusSpan = document.createElement('span');
-                statusSpan.className = 'status ' + (w.enabled ? 'enabled' : 'disabled');
-                statusSpan.textContent = w.enabled ? 'Active' : 'Disabled';
-                statusCell.appendChild(statusSpan);
-                row.appendChild(statusCell);
-
-                // Actions
+                // Actions (button group)
                 const actionsCell = document.createElement('td');
+                actionsCell.style.textAlign = 'right';
+                const group = document.createElement('div');
+                group.className = 'action-group';
+
                 const promptBtn = document.createElement('button');
-                promptBtn.className = 'view-btn';
-                promptBtn.textContent = 'View Prompt';
-                promptBtn.onclick = () => viewWebhookPrompt(w.id);
-                actionsCell.appendChild(promptBtn);
+                promptBtn.className = 'action-btn';
+                promptBtn.textContent = 'Prompt';
+                promptBtn.onclick = function() { viewWebhookPrompt(w.id); };
+                group.appendChild(promptBtn);
+
                 const runsBtn = document.createElement('button');
-                runsBtn.className = 'view-btn';
-                runsBtn.style.marginLeft = '5px';
-                runsBtn.textContent = 'View Runs';
-                runsBtn.onclick = () => showWebhookRuns(w.id);
-                actionsCell.appendChild(runsBtn);
+                runsBtn.className = 'action-btn';
+                runsBtn.textContent = 'Runs';
+                runsBtn.onclick = function() { showWebhookRuns(w.id); };
+                group.appendChild(runsBtn);
+
+                const delBtn = document.createElement('button');
+                delBtn.className = 'action-btn action-btn--danger';
+                delBtn.textContent = 'Delete';
+                delBtn.onclick = function() { deleteWebhook(w.id, w.name); };
+                group.appendChild(delBtn);
+
+                actionsCell.appendChild(group);
                 row.appendChild(actionsCell);
 
                 table.appendChild(row);
             });
         }
 
-        async function updateWebhookProvider(webhookId, command) {
+        async function updateWebhookField(webhookId, field, value) {
             try {
-                const res = await fetch('/api/webhook/' + webhookId + '/provider', {
+                const body = {};
+                body[field] = value;
+                const res = await fetch('/api/webhook/' + webhookId, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ command })
+                    body: JSON.stringify(body)
                 });
                 const data = await res.json();
                 if (data.error) {
                     showToast('Error: ' + data.error, 'error');
                 } else {
-                    showToast('Provider updated', 'success');
+                    showToast('Webhook updated', 'success');
+                    refresh();
                 }
             } catch (e) {
                 showToast('Error: ' + e.message, 'error');
             }
+        }
+
+        function deleteWebhook(webhookId, name) {
+            showConfirm('Delete Webhook', 'Are you sure you want to delete "' + name + '"?', async () => {
+                try {
+                    const res = await fetch('/api/webhook/' + webhookId, { method: 'DELETE' });
+                    const data = await res.json();
+                    if (data.success) {
+                        showToast('Webhook deleted', 'success');
+                        refresh();
+                    } else {
+                        showToast('Error: ' + (data.error || 'Unknown'), 'error');
+                    }
+                } catch (e) {
+                    showToast('Error: ' + e.message, 'error');
+                }
+            });
         }
 
         function viewWebhookPrompt(webhookId) {
@@ -1403,23 +1623,7 @@
             const scheduledJobs = jobsRes.filter(j => j.cron !== 'manual' && j.cron !== 'webhook');
 
             // Render scheduled jobs table
-            document.getElementById('jobs-table').innerHTML = scheduledJobs.length === 0
-                ? '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: var(--spacing-lg);">No scheduled jobs. Create one using the MCP tool.</td></tr>'
-                : scheduledJobs.map(j => {
-                    const jwsId = j.workspace_id || '';
-                    const jwsName = jwsId ? (workspacesData.find(w => w.id === jwsId) || {}).name || '' : '';
-                    return `
-                <tr>
-                    <td><code style="color: var(--accent-cyan);">${j.id.substring(0, 8)}</code></td>
-                    <td>${escapeHtml(j.name)}</td>
-                    <td><span class="cron">${j.cron}</span></td>
-                    <td><span class="status ${j.enabled ? 'enabled' : 'disabled'}">${j.enabled ? 'Enabled' : 'Disabled'}</span></td>
-                    <td><span class="status badge-workspace">${escapeHtml(jwsName || 'Default')}</span></td>
-                    <td style="color: var(--text-secondary);">${j.last_executed_at ? new Date(j.last_executed_at).toLocaleString() : 'Never'}</td>
-                    <td style="color: var(--text-secondary);">${escapeHtml(j.prompt.substring(0, 50))}${j.prompt.length > 50 ? '...' : ''}</td>
-                    <td><button class="delete-btn" onclick="deleteJob('${j.id}', '${escapeHtml(j.name).replace(/'/g, "\\'")}')">Delete</button></td>
-                </tr>
-                `}).join('');
+            renderScheduledJobsTable(scheduledJobs);
 
             // Separate runs by type
             const manualRuns = runsRes.filter(r => getRunType(r) === 'manual');

@@ -146,6 +146,48 @@ gap: 6px;
 .badge-webhook { background: rgba(139, 92, 246, 0.15); color: var(--webhook-color); border-left: 3px solid var(--webhook-color); }
 .badge-workspace { background: rgba(79, 70, 229, 0.12); color: var(--info); border-left: 3px solid var(--info); font-size: 10px; }
 
+/* Action button group */
+.action-group { display: flex; gap: 2px; justify-content: flex-end; }
+.action-group .action-btn {
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-default);
+    padding: 5px 10px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 500;
+    transition: all 0.15s ease;
+    white-space: nowrap;
+}
+.action-group .action-btn:first-child { border-radius: 4px 0 0 4px; }
+.action-group .action-btn:last-child { border-radius: 0 4px 4px 0; }
+.action-group .action-btn:only-child { border-radius: 4px; }
+.action-group .action-btn:hover { background: var(--bg-elevated); color: var(--text-primary); border-color: var(--border-hover); }
+.action-group .action-btn--danger { color: var(--error); }
+.action-group .action-btn--danger:hover { background: var(--error); color: white; border-color: var(--error); }
+.action-group .action-btn--primary { color: var(--accent-blue); }
+.action-group .action-btn--primary:hover { background: var(--accent-blue); color: white; border-color: var(--accent-blue); }
+
+/* Inline toggle switch */
+.toggle-switch { position: relative; display: inline-block; width: 34px; height: 18px; vertical-align: middle; }
+.toggle-switch input { opacity: 0; width: 0; height: 0; }
+.toggle-switch .slider { position: absolute; cursor: pointer; inset: 0; background: var(--bg-elevated); border: 1px solid var(--border-default); border-radius: 18px; transition: 0.2s; }
+.toggle-switch .slider:before { content: ""; position: absolute; height: 12px; width: 12px; left: 2px; bottom: 2px; background: var(--text-muted); border-radius: 50%; transition: 0.2s; }
+.toggle-switch input:checked + .slider { background: rgba(16, 185, 129, 0.25); border-color: var(--success); }
+.toggle-switch input:checked + .slider:before { transform: translateX(16px); background: var(--success); }
+
+/* Inline select for tables */
+.inline-select {
+    padding: 3px 6px;
+    border: 1px solid var(--border-default);
+    border-radius: 4px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-size: 11px;
+    cursor: pointer;
+    max-width: 120px;
+}
+
 /* ========================================
    BUTTONS - Sharp, Uppercase
    ======================================== */

@@ -2036,6 +2036,36 @@ async def api_webhook_provider_handler(request):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
+@require_auth
+async def api_update_webhook_handler(request):
+    """Update a webhook via REST API"""
+    webhook_id = request.path_params['webhook_id']
+    try:
+        body = await request.json()
+        result = json.loads(_unwrap_mcp_tool(update_webhook)(
+            webhook_id,
+            name=body.get('name'),
+            prompt_template=body.get('prompt_template'),
+            description=body.get('description'),
+            enabled=body.get('enabled'),
+            command=body.get('command'),
+            workspace_id=body.get('workspace_id'),
+        ))
+        if "error" in result:
+            return JSONResponse(result, status_code=400)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+@require_auth
+async def api_delete_webhook_handler(request):
+    """Delete a webhook via REST API"""
+    webhook_id = request.path_params['webhook_id']
+    result = json.loads(_unwrap_mcp_tool(delete_webhook)(webhook_id))
+    if "error" in result:
+        return JSONResponse(result, status_code=400)
+    return JSONResponse(result)
+
 async def webhook_trigger_handler(request):
     """Handle incoming webhook POST requests"""
     token = request.path_params.get("token")
@@ -2534,7 +2564,7 @@ async def api_create_job_handler(request):
         if isinstance(environment, dict):
             environment = json.dumps(environment)
 
-        result = json.loads(create_job(name, cron, prompt, command, tools, environment, timeout_minutes))
+        result = json.loads(_unwrap_mcp_tool(create_job)(name, cron, prompt, command, tools, environment, timeout_minutes))
         if "error" in result:
             return JSONResponse(result, status_code=400)
         return JSONResponse(result)
@@ -2568,7 +2598,9 @@ async def api_update_job_handler(request):
         if tools is not None and isinstance(tools, list):
             tools = json.dumps(tools)
 
-        result = json.loads(update_job(job_id, name=name, cron=cron, prompt=prompt, enabled=enabled, timeout_minutes=timeout_minutes, tools=tools))
+        command = body.get('command')
+        workspace_id = body.get('workspace_id')
+        result = json.loads(_unwrap_mcp_tool(update_job)(job_id, name=name, cron=cron, prompt=prompt, enabled=enabled, timeout_minutes=timeout_minutes, tools=tools, command=command, workspace_id=workspace_id))
         if "error" in result:
             return JSONResponse(result, status_code=400)
         return JSONResponse(result)
@@ -2579,7 +2611,7 @@ async def api_update_job_handler(request):
 async def api_trigger_job_handler(request):
     """Trigger a job to run immediately via REST API"""
     job_id = request.path_params['job_id']
-    result = json.loads(trigger_job(job_id))
+    result = json.loads(_unwrap_mcp_tool(trigger_job)(job_id))
     if "error" in result:
         return JSONResponse(result, status_code=404)
     return JSONResponse(result)
@@ -2975,6 +3007,8 @@ dashboard_routes = [
     Route("/api/fixed-server-toggle", api_fixed_server_toggle_handler, methods=["POST"]),
     Route("/api/dynamic-server-toggle", api_dynamic_server_toggle_handler, methods=["POST"]),
     Route("/api/webhooks", api_webhooks_handler),
+    Route("/api/webhook/{webhook_id}", api_update_webhook_handler, methods=["PUT"]),
+    Route("/api/webhook/{webhook_id}", api_delete_webhook_handler, methods=["DELETE"]),
     Route("/api/webhook/{webhook_id}/provider", api_webhook_provider_handler, methods=["PUT"]),
     Route("/api/tool-logs", api_tool_logs_handler),
     Route("/webhook/{token}", webhook_trigger_handler, methods=["POST"]),
@@ -3072,7 +3106,7 @@ def create_job(name: str, cron: str, prompt: str, command: str = "claude", tools
     return json.dumps(result)
 
 @mcp.tool()
-def update_job(job_id: str, name: str = None, cron: str = None, prompt: str = None, enabled: bool = None, timeout_minutes: int = None, tools: str = None, workspace_id: str = None) -> str:
+def update_job(job_id: str, name: str = None, cron: str = None, prompt: str = None, enabled: bool = None, timeout_minutes: int = None, tools: str = None, command: str = None, workspace_id: str = None) -> str:
     """Update an existing job.
 
     Args:
@@ -3083,6 +3117,7 @@ def update_job(job_id: str, name: str = None, cron: str = None, prompt: str = No
         enabled: Enable/disable the job
         timeout_minutes: Max runtime in minutes
         tools: JSON array of tools (e.g., '["mcp__email__send_email"]')
+        command: AI provider: "claude", "openai", or "ollama"
         workspace_id: Workspace ID for tool isolation (use "" to clear)
     """
     conn = get_db()
@@ -3112,6 +3147,9 @@ def update_job(job_id: str, name: str = None, cron: str = None, prompt: str = No
     if enabled is not None:
         updates.append("enabled = ?")
         params.append(1 if enabled else 0)
+    if command is not None:
+        updates.append("command = ?")
+        params.append(command)
     if timeout_minutes is not None:
         updates.append("timeout_minutes = ?")
         params.append(timeout_minutes)
