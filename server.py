@@ -529,6 +529,42 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_oauth_refresh_tokens_client ON oauth_refresh_tokens(client_id);
 
+        -- Workspace tables
+        CREATE TABLE IF NOT EXISTS workspaces (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT DEFAULT '',
+            default_prompt TEXT DEFAULT '',
+            is_default INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS workspace_tools (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+            UNIQUE(workspace_id, tool_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS workspace_servers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workspace_id TEXT NOT NULL,
+            server_name TEXT NOT NULL,
+            enabled INTEGER DEFAULT 1,
+            FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE,
+            UNIQUE(workspace_id, server_name)
+        );
+
+        CREATE TABLE IF NOT EXISTS tool_classifications (
+            tool_name TEXT PRIMARY KEY,
+            access_level TEXT NOT NULL DEFAULT 'read',
+            auto_classified INTEGER DEFAULT 1,
+            updated_at TEXT NOT NULL
+        );
+
         -- Insert default settings if not exists
         INSERT OR IGNORE INTO settings (key, value) VALUES
             ('allowed_tools', '["WebSearch","WebFetch","Read","Write","Edit","Bash"]'),
@@ -576,7 +612,58 @@ def init_db():
     try:
         conn.execute("ALTER TABLE webhooks ADD COLUMN command TEXT DEFAULT 'claude'")
     except: pass
+
+    # Workspace column migrations
+    try:
+        conn.execute("ALTER TABLE jobs ADD COLUMN workspace_id TEXT")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE runs ADD COLUMN workspace_id TEXT")
+    except: pass
+    try:
+        conn.execute("ALTER TABLE webhooks ADD COLUMN workspace_id TEXT")
+    except: pass
+
     conn.commit()
+
+    # Create default workspace from current global settings if none exists
+    existing = conn.execute("SELECT COUNT(*) as cnt FROM workspaces").fetchone()
+    if existing['cnt'] == 0:
+        now = utc_now_iso()
+        workspace_id = "default"
+        conn.execute("""
+            INSERT INTO workspaces (id, name, description, default_prompt, is_default, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (workspace_id, "Default", "Default workspace created from global settings", "", 1, now, now))
+
+        # Copy current allowed_tools as workspace tools
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key = 'allowed_tools'").fetchone()
+            if row:
+                tools = json.loads(row['value'])
+                for tool_name in tools:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO workspace_tools (workspace_id, tool_name, enabled) VALUES (?, ?, 1)",
+                        (workspace_id, tool_name)
+                    )
+        except: pass
+
+        # Copy current enabled MCP servers as workspace servers
+        try:
+            row = conn.execute("SELECT value FROM settings WHERE key = 'mcp_servers'").fetchone()
+            if row:
+                servers = json.loads(row['value'])
+                for server in servers:
+                    server_name = server.get('name', '')
+                    if server_name:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO workspace_servers (workspace_id, server_name, enabled) VALUES (?, ?, 1)",
+                            (workspace_id, server_name)
+                        )
+        except: pass
+
+        conn.commit()
+
     return conn
 
 def get_db():
@@ -1055,6 +1142,97 @@ def _discover_mcp_tool_allowlist(mcp_config: dict[str, dict]) -> list[str]:
     return allowlist
 
 
+# === Tool Access Level Classification ===
+
+DANGEROUS_PATTERNS = ['bash', 'shell', 'exec', 'delete', 'remove', 'kill', 'destroy', 'drop', 'purge']
+ADMIN_PATTERNS = ['enable', 'disable', 'configure', 'set_credential', 'create_mcp', 'update_mcp', 'delete_mcp']
+WRITE_PATTERNS = ['write', 'edit', 'create', 'update', 'send', 'post', 'trigger', 'publish']
+
+def _auto_classify_tool(tool_name: str) -> str:
+    """Auto-classify a tool into an access level based on name patterns."""
+    lower = tool_name.lower()
+    for pattern in DANGEROUS_PATTERNS:
+        if pattern in lower:
+            return 'dangerous'
+    for pattern in ADMIN_PATTERNS:
+        if pattern in lower:
+            return 'admin'
+    for pattern in WRITE_PATTERNS:
+        if pattern in lower:
+            return 'write'
+    return 'read'
+
+
+def _classify_all_discovered_tools():
+    """Auto-classify all known tools and MCP server tools. Preserves manual overrides."""
+    conn = get_db()
+    now = utc_now_iso()
+
+    # Built-in tools
+    builtin_tools = ["WebSearch", "WebFetch", "Read", "Write", "Edit", "Bash"]
+    for tool_name in builtin_tools:
+        level = _auto_classify_tool(tool_name)
+        conn.execute("""
+            INSERT INTO tool_classifications (tool_name, access_level, auto_classified, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(tool_name) DO UPDATE SET
+                access_level = CASE WHEN auto_classified = 1 THEN excluded.access_level ELSE access_level END,
+                updated_at = CASE WHEN auto_classified = 1 THEN excluded.updated_at ELSE updated_at END
+        """, (tool_name, level, now))
+
+    # Discover tools from all MCP servers (fixed + dynamic)
+    for base_dir in [FIXED_SERVERS_DIR, DYNAMIC_SERVERS_DIR]:
+        if not base_dir.exists():
+            continue
+        for server_dir in base_dir.iterdir():
+            if not server_dir.is_dir():
+                continue
+            server_py = server_dir / "server.py"
+            if not server_py.exists():
+                continue
+            server_name = server_dir.name
+            try:
+                tool_names = _discover_python_mcp_tools(server_py)
+                for tool_name in tool_names:
+                    qualified = f"mcp__{server_name}__{tool_name}"
+                    level = _auto_classify_tool(qualified)
+                    conn.execute("""
+                        INSERT INTO tool_classifications (tool_name, access_level, auto_classified, updated_at)
+                        VALUES (?, ?, 1, ?)
+                        ON CONFLICT(tool_name) DO UPDATE SET
+                            access_level = CASE WHEN auto_classified = 1 THEN excluded.access_level ELSE access_level END,
+                            updated_at = CASE WHEN auto_classified = 1 THEN excluded.updated_at ELSE updated_at END
+                    """, (qualified, level, now))
+            except Exception as e:
+                print(f"[classify] Error classifying tools for {server_name}: {e}", file=sys.stderr)
+
+    # Also classify the Spinner MCP tools (admin tools)
+    admin_tool_names = [
+        "list_jobs", "get_job", "create_job", "update_job", "delete_job", "trigger_job",
+        "list_runs", "get_run", "kill_run",
+        "list_webhooks", "create_webhook", "update_webhook", "delete_webhook", "get_webhook",
+        "list_fixed_mcp_servers", "list_dynamic_mcp_servers",
+        "enable_fixed_server", "disable_fixed_server", "enable_mcp_server", "disable_mcp_server",
+        "set_server_credential", "get_server_credentials", "list_required_credentials", "get_unconfigured_servers",
+        "invoke_internal_mcp_tool", "create_mcp_server", "update_mcp_server", "delete_mcp_server", "get_dynamic_mcp_server",
+        "create_workspace", "list_workspaces", "get_workspace", "update_workspace", "delete_workspace",
+        "set_workspace_tools", "set_workspace_servers", "set_tool_access_level", "get_tool_classifications",
+    ]
+    for tool_name in admin_tool_names:
+        level = _auto_classify_tool(tool_name)
+        conn.execute("""
+            INSERT INTO tool_classifications (tool_name, access_level, auto_classified, updated_at)
+            VALUES (?, ?, 1, ?)
+            ON CONFLICT(tool_name) DO UPDATE SET
+                access_level = CASE WHEN auto_classified = 1 THEN excluded.access_level ELSE access_level END,
+                updated_at = CASE WHEN auto_classified = 1 THEN excluded.updated_at ELSE updated_at END
+        """, (tool_name, level, now))
+
+    conn.commit()
+    conn.close()
+    print("[classify] Tool classification complete", file=sys.stderr)
+
+
 # === OAuth 2.1 Helper Functions ===
 
 def hash_client_secret(secret: str) -> str:
@@ -1362,6 +1540,8 @@ async def api_run_prompt_handler(request):
 
         # Get provider from request (default to first available or "claude")
         command = body.get('command', _get_default_provider())
+        raw_workspace = body.get('workspace_id', '') or None
+        workspace_id = _resolve_workspace_id(raw_workspace) if raw_workspace else None
 
         # Validate provider is registered
         if command not in PROVIDERS:
@@ -1374,17 +1554,17 @@ async def api_run_prompt_handler(request):
 
         conn = get_db()
         conn.execute("""
-            INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (job_id, f"Manual Run ({now[:16]})", "manual", prompt, command, "[]", "{}", 0, now, now))
+            INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, workspace_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (job_id, f"Manual Run ({now[:16]})", "manual", prompt, command, "[]", "{}", 0, workspace_id, now, now))
         conn.commit()
 
         # Create and trigger the run
         run_id = str(uuid.uuid4())[:8]
         conn.execute("""
-            INSERT INTO runs (id, job_id, started_at, prompt, command, state)
-            VALUES (?, ?, ?, ?, ?, 'pending')
-        """, (run_id, job_id, now, prompt, command))
+            INSERT INTO runs (id, job_id, started_at, prompt, command, state, workspace_id)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?)
+        """, (run_id, job_id, now, prompt, command, workspace_id))
         conn.commit()
         conn.close()
 
@@ -1882,7 +2062,7 @@ async def webhook_trigger_handler(request):
         prompt = render_webhook_template(webhook["prompt_template"], payload)
 
         # Determine provider: webhook setting > payload override > default
-        command = webhook.get("command") or "claude"
+        command = webhook["command"] or "claude"
         if command not in PROVIDERS:
             command = _get_default_provider()
         if isinstance(payload, dict) and payload.get('_provider'):
@@ -1893,18 +2073,19 @@ async def webhook_trigger_handler(request):
         # Create a disabled job for this webhook run (follows quick-run pattern)
         job_id = str(uuid.uuid4())[:8]
         now = utc_now_iso()
+        webhook_workspace_id = webhook['workspace_id'] or None
 
         conn.execute("""
-            INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (job_id, f"Webhook: {webhook['name']} ({now[:16]})", "webhook", prompt, command, "[]", "{}", 0, now, now))
+            INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, enabled, created_at, updated_at, workspace_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (job_id, f"Webhook: {webhook['name']} ({now[:16]})", "webhook", prompt, command, "[]", "{}", 0, now, now, webhook_workspace_id))
 
         # Create the run with webhook_id
         run_id = str(uuid.uuid4())[:8]
         conn.execute("""
-            INSERT INTO runs (id, job_id, started_at, prompt, command, state, webhook_id)
-            VALUES (?, ?, ?, ?, ?, 'pending', ?)
-        """, (run_id, job_id, now, prompt, command, webhook["id"]))
+            INSERT INTO runs (id, job_id, started_at, prompt, command, state, webhook_id, workspace_id)
+            VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)
+        """, (run_id, job_id, now, prompt, command, webhook["id"], webhook_workspace_id))
 
         # Update webhook stats
         conn.execute("""
@@ -2442,6 +2623,328 @@ class CORSMiddleware:
 
         await self.app(scope, receive, send_with_cors)
 
+
+# === Workspace API Endpoints ===
+
+@require_auth
+async def api_workspaces_handler(request):
+    """List all workspaces"""
+    conn = get_db()
+    workspaces = conn.execute("SELECT * FROM workspaces ORDER BY is_default DESC, name").fetchall()
+    result = []
+    for ws in workspaces:
+        tool_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM workspace_tools WHERE workspace_id = ? AND enabled = 1",
+            (ws['id'],)
+        ).fetchone()['cnt']
+        server_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM workspace_servers WHERE workspace_id = ? AND enabled = 1",
+            (ws['id'],)
+        ).fetchone()['cnt']
+        # Count jobs using this workspace
+        job_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM jobs WHERE workspace_id = ?",
+            (ws['id'],)
+        ).fetchone()['cnt']
+        result.append({
+            "id": ws['id'],
+            "name": ws['name'],
+            "description": ws['description'],
+            "default_prompt": ws['default_prompt'],
+            "is_default": bool(ws['is_default']),
+            "enabled_tools": tool_count,
+            "enabled_servers": server_count,
+            "job_count": job_count,
+            "created_at": ws['created_at'],
+            "updated_at": ws['updated_at'],
+        })
+    conn.close()
+    return JSONResponse(result)
+
+
+@require_auth
+async def api_workspace_handler(request):
+    """Get workspace details"""
+    workspace_id = request.path_params['id']
+    conn = get_db()
+    ws = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if not ws:
+        conn.close()
+        return JSONResponse({"error": "Workspace not found"}, status_code=404)
+
+    tools = conn.execute(
+        "SELECT tool_name, enabled FROM workspace_tools WHERE workspace_id = ?",
+        (workspace_id,)
+    ).fetchall()
+    servers = conn.execute(
+        "SELECT server_name, enabled FROM workspace_servers WHERE workspace_id = ?",
+        (workspace_id,)
+    ).fetchall()
+
+    # Get classifications
+    all_classifications = conn.execute("SELECT tool_name, access_level FROM tool_classifications").fetchall()
+    classifications = {r['tool_name']: r['access_level'] for r in all_classifications}
+
+    conn.close()
+    return JSONResponse({
+        "id": ws['id'],
+        "name": ws['name'],
+        "description": ws['description'],
+        "default_prompt": ws['default_prompt'],
+        "is_default": bool(ws['is_default']),
+        "tools": [{"name": t['tool_name'], "enabled": bool(t['enabled']),
+                    "access_level": classifications.get(t['tool_name'], 'read')} for t in tools],
+        "servers": [{"name": s['server_name'], "enabled": bool(s['enabled'])} for s in servers],
+        "created_at": ws['created_at'],
+        "updated_at": ws['updated_at'],
+    })
+
+
+@require_auth
+async def api_create_workspace_handler(request):
+    """Create a new workspace"""
+    body = await request.json()
+    name = body.get('name', '').strip()
+    if not name:
+        return JSONResponse({"error": "Name is required"}, status_code=400)
+
+    workspace_id = str(uuid.uuid4())[:8]
+    now = utc_now_iso()
+    conn = get_db()
+    try:
+        conn.execute("""
+            INSERT INTO workspaces (id, name, description, default_prompt, is_default, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?)
+        """, (workspace_id, name, body.get('description', ''), body.get('default_prompt', ''), now, now))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return JSONResponse({"error": f"Workspace '{name}' already exists"}, status_code=409)
+    conn.close()
+    return JSONResponse({"success": True, "workspace_id": workspace_id, "name": name})
+
+
+@require_auth
+async def api_update_workspace_handler(request):
+    """Update workspace metadata and tool/server configuration"""
+    workspace_id = request.path_params['id']
+    body = await request.json()
+    conn = get_db()
+
+    ws = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if not ws:
+        conn.close()
+        return JSONResponse({"error": "Workspace not found"}, status_code=404)
+
+    now = utc_now_iso()
+
+    # Handle is_default
+    if body.get('is_default'):
+        conn.execute("UPDATE workspaces SET is_default = 0, updated_at = ?", (now,))
+
+    # Update metadata fields
+    updates = []
+    params = []
+    for field in ('name', 'description', 'default_prompt'):
+        if field in body:
+            updates.append(f"{field} = ?")
+            params.append(body[field])
+    if 'is_default' in body:
+        updates.append("is_default = ?")
+        params.append(1 if body['is_default'] else 0)
+    if updates:
+        updates.append("updated_at = ?")
+        params.append(now)
+        params.append(workspace_id)
+        try:
+            conn.execute(f"UPDATE workspaces SET {', '.join(updates)} WHERE id = ?", params)
+        except sqlite3.IntegrityError:
+            conn.close()
+            return JSONResponse({"error": f"Workspace name already exists"}, status_code=409)
+
+    # Handle tool updates: {tools: [{name: "Read", enabled: true}, ...]}
+    if 'tools' in body:
+        # Build set of valid tool names for validation
+        valid_tools = set(BUILTIN_TOOLS)
+        valid_tools.update(r['tool_name'] for r in conn.execute("SELECT tool_name FROM tool_classifications").fetchall())
+        invalid_tools = [t['name'] for t in body['tools'] if t['name'] not in valid_tools]
+        if invalid_tools:
+            conn.close()
+            return JSONResponse({"error": f"Unknown tools: {invalid_tools}"}, status_code=400)
+        for tool in body['tools']:
+            conn.execute("""
+                INSERT INTO workspace_tools (workspace_id, tool_name, enabled)
+                VALUES (?, ?, ?)
+                ON CONFLICT(workspace_id, tool_name) DO UPDATE SET enabled = excluded.enabled
+            """, (workspace_id, tool['name'], 1 if tool.get('enabled', True) else 0))
+
+    # Handle server updates: {servers: [{name: "email", enabled: true}, ...]}
+    if 'servers' in body:
+        mcp_servers = _get_mcp_servers_setting()
+        known_servers = {s.get('name') for s in mcp_servers if s.get('name')}
+        invalid_servers = [s['name'] for s in body['servers'] if s['name'] not in known_servers]
+        if invalid_servers:
+            conn.close()
+            return JSONResponse({"error": f"Unknown servers: {invalid_servers}"}, status_code=400)
+        for server in body['servers']:
+            conn.execute("""
+                INSERT INTO workspace_servers (workspace_id, server_name, enabled)
+                VALUES (?, ?, ?)
+                ON CONFLICT(workspace_id, server_name) DO UPDATE SET enabled = excluded.enabled
+            """, (workspace_id, server['name'], 1 if server.get('enabled', True) else 0))
+
+    conn.commit()
+    conn.close()
+    return JSONResponse({"success": True, "workspace_id": workspace_id})
+
+
+@require_auth
+async def api_delete_workspace_handler(request):
+    """Delete a workspace"""
+    workspace_id = request.path_params['id']
+    conn = get_db()
+    ws = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if not ws:
+        conn.close()
+        return JSONResponse({"error": "Workspace not found"}, status_code=404)
+    if ws['is_default']:
+        conn.close()
+        return JSONResponse({"error": "Cannot delete the default workspace"}, status_code=400)
+
+    active_jobs = conn.execute(
+        "SELECT COUNT(*) as cnt FROM jobs WHERE workspace_id = ? AND enabled = 1",
+        (workspace_id,)
+    ).fetchone()['cnt']
+    if active_jobs > 0:
+        conn.close()
+        return JSONResponse({"error": f"Cannot delete workspace with {active_jobs} active job(s)"}, status_code=400)
+
+    conn.execute("DELETE FROM workspace_tools WHERE workspace_id = ?", (workspace_id,))
+    conn.execute("DELETE FROM workspace_servers WHERE workspace_id = ?", (workspace_id,))
+    conn.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+    conn.commit()
+    conn.close()
+    return JSONResponse({"success": True, "deleted": workspace_id})
+
+
+@require_auth
+async def api_workspace_stats_handler(request):
+    """Get cost/usage stats for a workspace"""
+    workspace_id = request.path_params['id']
+    conn = get_db()
+    ws = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if not ws:
+        conn.close()
+        return JSONResponse({"error": "Workspace not found"}, status_code=404)
+
+    stats = conn.execute("""
+        SELECT
+            COUNT(*) as total_runs,
+            COALESCE(SUM(cost_usd), 0) as total_cost,
+            COALESCE(SUM(total_tokens), 0) as total_tokens,
+            COALESCE(SUM(input_tokens), 0) as input_tokens,
+            COALESCE(SUM(output_tokens), 0) as output_tokens
+        FROM runs WHERE workspace_id = ?
+    """, (workspace_id,)).fetchone()
+
+    conn.close()
+    return JSONResponse({
+        "workspace_id": workspace_id,
+        "total_runs": stats['total_runs'],
+        "total_cost": stats['total_cost'],
+        "total_tokens": stats['total_tokens'],
+        "input_tokens": stats['input_tokens'],
+        "output_tokens": stats['output_tokens'],
+    })
+
+
+@require_auth
+async def api_tool_classifications_handler(request):
+    """Get all tool classifications"""
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM tool_classifications ORDER BY tool_name").fetchall()
+    conn.close()
+    return JSONResponse([{
+        "tool_name": r['tool_name'],
+        "access_level": r['access_level'],
+        "auto_classified": bool(r['auto_classified']),
+        "updated_at": r['updated_at'],
+    } for r in rows])
+
+
+@require_auth
+async def api_set_tool_classification_handler(request):
+    """Override a tool's access level classification"""
+    tool_name = request.path_params['tool_name']
+    body = await request.json()
+    access_level = body.get('access_level', '')
+    if access_level not in ('read', 'write', 'admin', 'dangerous'):
+        return JSONResponse({"error": "Invalid access_level"}, status_code=400)
+
+    conn = get_db()
+    now = utc_now_iso()
+    conn.execute("""
+        INSERT INTO tool_classifications (tool_name, access_level, auto_classified, updated_at)
+        VALUES (?, ?, 0, ?)
+        ON CONFLICT(tool_name) DO UPDATE SET access_level = excluded.access_level, auto_classified = 0, updated_at = excluded.updated_at
+    """, (tool_name, access_level, now))
+    conn.commit()
+    conn.close()
+    return JSONResponse({"success": True, "tool_name": tool_name, "access_level": access_level})
+
+
+@require_auth
+async def api_server_tools_handler(request):
+    """Discover tools for a specific MCP server with classifications"""
+    server_name = request.path_params['name']
+
+    # Try to find the server in fixed or dynamic servers
+    server_path = None
+    for base_dir in [FIXED_SERVERS_DIR, DYNAMIC_SERVERS_DIR]:
+        candidate = base_dir / server_name / "server.py"
+        if candidate.exists():
+            server_path = candidate
+            break
+
+    if not server_path:
+        return JSONResponse({"error": f"Server '{server_name}' not found"}, status_code=404)
+
+    tool_names = _discover_python_mcp_tools(server_path)
+
+    # Get classifications
+    conn = get_db()
+    qualified_names = [f"mcp__{server_name}__{name}" for name in tool_names]
+    classifications = {}
+    if qualified_names:
+        placeholders = ','.join('?' * len(qualified_names))
+        rows = conn.execute(
+            f"SELECT tool_name, access_level FROM tool_classifications WHERE tool_name IN ({placeholders})",
+            qualified_names
+        ).fetchall()
+        classifications = {r['tool_name']: r['access_level'] for r in rows}
+
+    # Try to get docstrings for each tool
+    tools = []
+    for tool_name in tool_names:
+        qualified = f"mcp__{server_name}__{tool_name}"
+        description = ""
+        try:
+            func, error = _load_mcp_tool_from_file(server_name, server_path, tool_name)
+            if func and func.__doc__:
+                description = func.__doc__.strip().split('\n')[0]
+        except:
+            pass
+        tools.append({
+            "name": tool_name,
+            "qualified_name": qualified,
+            "description": description,
+            "access_level": classifications.get(qualified, _auto_classify_tool(qualified)),
+        })
+
+    conn.close()
+    return JSONResponse({"server_name": server_name, "tools": tools})
+
+
 dashboard_routes = [
     Route("/", dashboard_handler),
     Route("/dashboard", dashboard_handler),
@@ -2475,6 +2978,16 @@ dashboard_routes = [
     Route("/api/webhook/{webhook_id}/provider", api_webhook_provider_handler, methods=["PUT"]),
     Route("/api/tool-logs", api_tool_logs_handler),
     Route("/webhook/{token}", webhook_trigger_handler, methods=["POST"]),
+    # Workspace endpoints
+    Route("/api/workspaces", api_workspaces_handler, methods=["GET"]),
+    Route("/api/workspace", api_create_workspace_handler, methods=["POST"]),
+    Route("/api/workspace/{id}", api_workspace_handler, methods=["GET"]),
+    Route("/api/workspace/{id}", api_update_workspace_handler, methods=["PUT"]),
+    Route("/api/workspace/{id}", api_delete_workspace_handler, methods=["DELETE"]),
+    Route("/api/workspace/{id}/stats", api_workspace_stats_handler, methods=["GET"]),
+    Route("/api/tool-classifications", api_tool_classifications_handler, methods=["GET"]),
+    Route("/api/tool-classification/{tool_name:path}", api_set_tool_classification_handler, methods=["PUT"]),
+    Route("/api/server/{name}/tools", api_server_tools_handler, methods=["GET"]),
     # OAuth 2.1 endpoints
     Route("/.well-known/oauth-protected-resource", oauth_protected_resource_handler),
     Route("/.well-known/oauth-authorization-server", oauth_server_metadata_handler),
@@ -2502,7 +3015,7 @@ def get_job(job_id: str) -> str:
     return json.dumps(dict(job), indent=2)
 
 @mcp.tool()
-def create_job(name: str, cron: str, prompt: str, command: str = "claude", tools: str = "[]", environment: str = "{}", timeout_minutes: int = 30) -> str:
+def create_job(name: str, cron: str, prompt: str, command: str = "claude", tools: str = "[]", environment: str = "{}", timeout_minutes: int = 30, workspace_id: str = "") -> str:
     """
     Create a new scheduled job.
 
@@ -2519,6 +3032,7 @@ def create_job(name: str, cron: str, prompt: str, command: str = "claude", tools
                Built-in tools (Bash, Read, etc.) and mcp__* format are unchanged.
         environment: JSON object of environment variables
         timeout_minutes: Max runtime before killing the process (default: 30)
+        workspace_id: Optional workspace ID. If empty, uses the default workspace.
 
     Returns:
         JSON with success status, job_id, and optional tool_warnings if any tools were normalized.
@@ -2532,24 +3046,33 @@ def create_job(name: str, cron: str, prompt: str, command: str = "claude", tools
     # Normalize tool names (e.g., "email:send_email" -> "mcp__email__send_email")
     normalized_tools, tool_warnings = _normalize_tools_list(tools)
 
+    # Resolve workspace by name or ID
+    resolved_ws = None
+    if workspace_id:
+        resolved_ws = _resolve_workspace_id(workspace_id)
+        if not resolved_ws:
+            return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+
     job_id = str(uuid.uuid4())[:8]
     now = utc_now_iso()
 
     conn = get_db()
     conn.execute("""
-        INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, timeout_minutes, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (job_id, name, cron, prompt, command, normalized_tools, environment, timeout_minutes, now, now))
+        INSERT INTO jobs (id, name, cron, prompt, command, tools, environment, timeout_minutes, workspace_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (job_id, name, cron, prompt, command, normalized_tools, environment, timeout_minutes, resolved_ws, now, now))
     conn.commit()
     conn.close()
 
     result = {"success": True, "job_id": job_id}
+    if resolved_ws:
+        result["workspace_id"] = resolved_ws
     if tool_warnings:
         result["tool_warnings"] = tool_warnings
     return json.dumps(result)
 
 @mcp.tool()
-def update_job(job_id: str, name: str = None, cron: str = None, prompt: str = None, enabled: bool = None, timeout_minutes: int = None, tools: str = None) -> str:
+def update_job(job_id: str, name: str = None, cron: str = None, prompt: str = None, enabled: bool = None, timeout_minutes: int = None, tools: str = None, workspace_id: str = None) -> str:
     """Update an existing job.
 
     Args:
@@ -2560,6 +3083,7 @@ def update_job(job_id: str, name: str = None, cron: str = None, prompt: str = No
         enabled: Enable/disable the job
         timeout_minutes: Max runtime in minutes
         tools: JSON array of tools (e.g., '["mcp__email__send_email"]')
+        workspace_id: Workspace ID for tool isolation (use "" to clear)
     """
     conn = get_db()
     job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -2596,6 +3120,16 @@ def update_job(job_id: str, name: str = None, cron: str = None, prompt: str = No
         normalized_tools, tool_warnings = _normalize_tools_list(tools)
         updates.append("tools = ?")
         params.append(normalized_tools)
+    if workspace_id is not None:
+        if workspace_id == "":
+            resolved_ws = None
+        else:
+            resolved_ws = _resolve_workspace_id(workspace_id)
+            if not resolved_ws:
+                conn.close()
+                return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+        updates.append("workspace_id = ?")
+        params.append(resolved_ws)
 
     if updates:
         updates.append("updated_at = ?")
@@ -2706,7 +3240,7 @@ def trigger_job(job_id: str) -> str:
 # === Webhook Tools ===
 
 @mcp.tool()
-def create_webhook(name: str, prompt_template: str, description: str = "", command: str = "claude") -> str:
+def create_webhook(name: str, prompt_template: str, description: str = "", command: str = "claude", workspace_id: str = "") -> str:
     """
     Create a webhook endpoint that executes a prompt when triggered via HTTP POST.
 
@@ -2723,18 +3257,26 @@ def create_webhook(name: str, prompt_template: str, description: str = "", comma
         prompt_template: Template with {{payload}} placeholders
         description: Optional description
         command: AI provider to use: "claude" (default), "openai", or "ollama"
+        workspace_id: Optional workspace ID. If empty, uses the default workspace.
 
     Returns the full webhook URL with security token.
     """
+    # Resolve workspace by name or ID
+    resolved_ws = None
+    if workspace_id:
+        resolved_ws = _resolve_workspace_id(workspace_id)
+        if not resolved_ws:
+            return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+
     webhook_id = str(uuid.uuid4())[:8]
     secret_token = uuid.uuid4().hex  # 32-char hex token
     now = utc_now_iso()
 
     conn = get_db()
     conn.execute("""
-        INSERT INTO webhooks (id, name, description, secret_token, prompt_template, command, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (webhook_id, name, description, secret_token, prompt_template, command, now, now))
+        INSERT INTO webhooks (id, name, description, secret_token, prompt_template, command, workspace_id, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (webhook_id, name, description, secret_token, prompt_template, command, resolved_ws, now, now))
     conn.commit()
 
     conn.close()
@@ -2783,7 +3325,7 @@ def get_webhook(webhook_id: str) -> str:
     return json.dumps(result, indent=2)
 
 @mcp.tool()
-def update_webhook(webhook_id: str, name: str = None, prompt_template: str = None, description: str = None, enabled: bool = None, command: str = None) -> str:
+def update_webhook(webhook_id: str, name: str = None, prompt_template: str = None, description: str = None, enabled: bool = None, command: str = None, workspace_id: str = None) -> str:
     """Update an existing webhook.
 
     Args:
@@ -2793,6 +3335,7 @@ def update_webhook(webhook_id: str, name: str = None, prompt_template: str = Non
         description: New description
         enabled: Enable/disable the webhook
         command: AI provider to use: "claude", "openai", or "ollama"
+        workspace_id: Workspace ID for tool isolation (use "" to clear)
     """
     conn = get_db()
     webhook = conn.execute("SELECT * FROM webhooks WHERE id = ?", (webhook_id,)).fetchone()
@@ -2818,6 +3361,16 @@ def update_webhook(webhook_id: str, name: str = None, prompt_template: str = Non
     if command is not None:
         updates.append("command = ?")
         params.append(command)
+    if workspace_id is not None:
+        if workspace_id == "":
+            resolved_ws = None
+        else:
+            resolved_ws = _resolve_workspace_id(workspace_id)
+            if not resolved_ws:
+                conn.close()
+                return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+        updates.append("workspace_id = ?")
+        params.append(resolved_ws)
 
     if updates:
         updates.append("updated_at = ?")
@@ -4393,6 +4946,369 @@ if __name__ == "__main__":
 ```
 """
 
+# === Workspace MCP Tools ===
+
+@mcp.tool()
+def create_workspace(name: str, description: str = "", default_prompt: str = "") -> str:
+    """
+    Create a new workspace with isolated tool configuration.
+
+    Workspaces define which built-in tools and MCP servers are available for jobs and runs.
+
+    Args:
+        name: Unique workspace name
+        description: Optional description
+        default_prompt: Optional prompt prepended to all runs in this workspace
+    """
+    conn = get_db()
+    workspace_id = str(uuid.uuid4())[:8]
+    now = utc_now_iso()
+    try:
+        conn.execute("""
+            INSERT INTO workspaces (id, name, description, default_prompt, is_default, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 0, ?, ?)
+        """, (workspace_id, name, description, default_prompt, now, now))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return json.dumps({"error": f"Workspace '{name}' already exists"})
+    conn.close()
+    return json.dumps({"success": True, "workspace_id": workspace_id, "name": name})
+
+
+@mcp.tool()
+def list_workspaces() -> str:
+    """List all workspaces with tool and server counts."""
+    conn = get_db()
+    workspaces = conn.execute("SELECT * FROM workspaces ORDER BY is_default DESC, name").fetchall()
+    result = []
+    for ws in workspaces:
+        tool_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM workspace_tools WHERE workspace_id = ? AND enabled = 1",
+            (ws['id'],)
+        ).fetchone()['cnt']
+        server_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM workspace_servers WHERE workspace_id = ? AND enabled = 1",
+            (ws['id'],)
+        ).fetchone()['cnt']
+        result.append({
+            "id": ws['id'],
+            "name": ws['name'],
+            "description": ws['description'],
+            "default_prompt": ws['default_prompt'],
+            "is_default": bool(ws['is_default']),
+            "enabled_tools": tool_count,
+            "enabled_servers": server_count,
+            "created_at": ws['created_at'],
+            "updated_at": ws['updated_at'],
+        })
+    conn.close()
+    return json.dumps(result, indent=2)
+
+
+@mcp.tool()
+def get_workspace(workspace_id: str) -> str:
+    """
+    Get full workspace details including enabled tools and servers.
+
+    Args:
+        workspace_id: The workspace ID or name
+    """
+    resolved = _resolve_workspace_id(workspace_id)
+    if not resolved:
+        return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+    workspace_id = resolved
+    conn = get_db()
+    ws = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if not ws:
+        conn.close()
+        return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+
+    tools = conn.execute(
+        "SELECT tool_name, enabled FROM workspace_tools WHERE workspace_id = ?",
+        (workspace_id,)
+    ).fetchall()
+    servers = conn.execute(
+        "SELECT server_name, enabled FROM workspace_servers WHERE workspace_id = ?",
+        (workspace_id,)
+    ).fetchall()
+
+    # Get classifications for enabled tools
+    tool_names = [t['tool_name'] for t in tools]
+    classifications = {}
+    if tool_names:
+        placeholders = ','.join('?' * len(tool_names))
+        rows = conn.execute(
+            f"SELECT tool_name, access_level FROM tool_classifications WHERE tool_name IN ({placeholders})",
+            tool_names
+        ).fetchall()
+        classifications = {r['tool_name']: r['access_level'] for r in rows}
+
+    conn.close()
+    return json.dumps({
+        "id": ws['id'],
+        "name": ws['name'],
+        "description": ws['description'],
+        "default_prompt": ws['default_prompt'],
+        "is_default": bool(ws['is_default']),
+        "tools": [{"name": t['tool_name'], "enabled": bool(t['enabled']),
+                    "access_level": classifications.get(t['tool_name'], 'read')} for t in tools],
+        "servers": [{"name": s['server_name'], "enabled": bool(s['enabled'])} for s in servers],
+        "created_at": ws['created_at'],
+        "updated_at": ws['updated_at'],
+    }, indent=2)
+
+
+@mcp.tool()
+def update_workspace(workspace_id: str, name: str = "", description: str = "", default_prompt: str = "", is_default: int = -1) -> str:
+    """
+    Update workspace metadata.
+
+    Args:
+        workspace_id: The workspace ID or name
+        name: New name (empty to keep current)
+        description: New description (empty to keep current)
+        default_prompt: New default prompt (empty to keep current)
+        is_default: Set to 1 to make this the default workspace, 0 to unset, -1 to keep current
+    """
+    resolved = _resolve_workspace_id(workspace_id)
+    if not resolved:
+        return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+    workspace_id = resolved
+    conn = get_db()
+    ws = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if not ws:
+        conn.close()
+        return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+
+    now = utc_now_iso()
+
+    if is_default == 1:
+        # Unset previous default
+        conn.execute("UPDATE workspaces SET is_default = 0, updated_at = ?", (now,))
+
+    updates = []
+    params = []
+    if name:
+        updates.append("name = ?")
+        params.append(name)
+    if description:
+        updates.append("description = ?")
+        params.append(description)
+    if default_prompt:
+        updates.append("default_prompt = ?")
+        params.append(default_prompt)
+    if is_default >= 0:
+        updates.append("is_default = ?")
+        params.append(is_default)
+    updates.append("updated_at = ?")
+    params.append(now)
+    params.append(workspace_id)
+
+    try:
+        conn.execute(f"UPDATE workspaces SET {', '.join(updates)} WHERE id = ?", params)
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return json.dumps({"error": f"Workspace name '{name}' already exists"})
+    conn.close()
+    return json.dumps({"success": True, "workspace_id": workspace_id})
+
+
+@mcp.tool()
+def delete_workspace(workspace_id: str) -> str:
+    """
+    Delete a workspace. Cannot delete the default workspace.
+
+    Args:
+        workspace_id: The workspace ID or name
+    """
+    resolved = _resolve_workspace_id(workspace_id)
+    if not resolved:
+        return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+    workspace_id = resolved
+    conn = get_db()
+    ws = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if not ws:
+        conn.close()
+        return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+    if ws['is_default']:
+        conn.close()
+        return json.dumps({"error": "Cannot delete the default workspace"})
+
+    # Check for active jobs using this workspace
+    active_jobs = conn.execute(
+        "SELECT COUNT(*) as cnt FROM jobs WHERE workspace_id = ? AND enabled = 1",
+        (workspace_id,)
+    ).fetchone()['cnt']
+    if active_jobs > 0:
+        conn.close()
+        return json.dumps({"error": f"Cannot delete workspace with {active_jobs} active job(s). Disable or reassign them first."})
+
+    conn.execute("DELETE FROM workspace_tools WHERE workspace_id = ?", (workspace_id,))
+    conn.execute("DELETE FROM workspace_servers WHERE workspace_id = ?", (workspace_id,))
+    conn.execute("DELETE FROM workspaces WHERE id = ?", (workspace_id,))
+    conn.commit()
+    conn.close()
+    return json.dumps({"success": True, "deleted": workspace_id})
+
+
+@mcp.tool()
+def set_workspace_tools(workspace_id: str, tool_names: str = "", enabled: int = 1, all: int = 0, access_level: str = "") -> str:
+    """
+    Enable or disable tools in a workspace. Supports batch operations.
+
+    Args:
+        workspace_id: The workspace ID or name
+        tool_names: Comma-separated tool names (e.g., "Read,Bash,Write" or "mcp__email__send_email,mcp__scheduler__create_job")
+        enabled: 1 to enable, 0 to disable
+        all: Set to 1 to apply to ALL known tools (ignores tool_names)
+        access_level: Filter by access level when used with all=1 (e.g., "read", "write", "admin", "dangerous"). Empty means all levels.
+    """
+    resolved = _resolve_workspace_id(workspace_id)
+    if not resolved:
+        return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+    workspace_id = resolved
+    conn = get_db()
+
+    # Build the set of all valid tools
+    valid_tools = set(BUILTIN_TOOLS)
+    classified_rows = conn.execute("SELECT tool_name, access_level FROM tool_classifications").fetchall()
+    classified_map = {r['tool_name']: r['access_level'] for r in classified_rows}
+    valid_tools.update(classified_map.keys())
+
+    if all:
+        # Enable/disable all tools, optionally filtered by access_level
+        if access_level:
+            targets = [t for t, lvl in classified_map.items() if lvl == access_level]
+            # Also include built-in tools matching the level
+            for t in BUILTIN_TOOLS:
+                if classified_map.get(t) == access_level and t not in targets:
+                    targets.append(t)
+        else:
+            targets = sorted(valid_tools)
+    else:
+        if not tool_names:
+            conn.close()
+            return json.dumps({"error": "Provide tool_names (comma-separated) or set all=1"})
+        targets = [t.strip() for t in tool_names.split(",") if t.strip()]
+
+    # Validate all targets exist
+    invalid = [t for t in targets if t not in valid_tools]
+    if invalid:
+        conn.close()
+        return json.dumps({"error": f"Unknown tools: {invalid}. Use get_tool_classifications() to see available tools."})
+
+    # Batch upsert
+    for tool_name in targets:
+        conn.execute("""
+            INSERT INTO workspace_tools (workspace_id, tool_name, enabled)
+            VALUES (?, ?, ?)
+            ON CONFLICT(workspace_id, tool_name) DO UPDATE SET enabled = excluded.enabled
+        """, (workspace_id, tool_name, enabled))
+    conn.commit()
+    conn.close()
+    action = "enabled" if enabled else "disabled"
+    return json.dumps({"success": True, "workspace_id": workspace_id, action: targets, "count": len(targets)})
+
+
+@mcp.tool()
+def set_workspace_servers(workspace_id: str, server_names: str = "", enabled: int = 1, all: int = 0) -> str:
+    """
+    Enable or disable MCP servers in a workspace. Supports batch operations.
+
+    Args:
+        workspace_id: The workspace ID or name
+        server_names: Comma-separated server names (e.g., "email,scheduler,ignition")
+        enabled: 1 to enable, 0 to disable
+        all: Set to 1 to apply to ALL known servers (ignores server_names)
+    """
+    resolved = _resolve_workspace_id(workspace_id)
+    if not resolved:
+        return json.dumps({"error": f"Workspace '{workspace_id}' not found"})
+    workspace_id = resolved
+    conn = get_db()
+
+    # Get all known servers
+    mcp_servers = _get_mcp_servers_setting()
+    known_servers = {s.get('name') for s in mcp_servers if s.get('name')}
+
+    if all:
+        targets = sorted(known_servers)
+    else:
+        if not server_names:
+            conn.close()
+            return json.dumps({"error": "Provide server_names (comma-separated) or set all=1"})
+        targets = [s.strip() for s in server_names.split(",") if s.strip()]
+
+    # Validate
+    invalid = [s for s in targets if s not in known_servers]
+    if invalid:
+        conn.close()
+        return json.dumps({"error": f"Unknown servers: {invalid}. Available: {sorted(known_servers)}"})
+
+    # Batch upsert
+    for server_name in targets:
+        conn.execute("""
+            INSERT INTO workspace_servers (workspace_id, server_name, enabled)
+            VALUES (?, ?, ?)
+            ON CONFLICT(workspace_id, server_name) DO UPDATE SET enabled = excluded.enabled
+        """, (workspace_id, server_name, enabled))
+    conn.commit()
+    conn.close()
+    action = "enabled" if enabled else "disabled"
+    return json.dumps({"success": True, "workspace_id": workspace_id, action: targets, "count": len(targets)})
+
+
+@mcp.tool()
+def set_tool_access_level(tool_name: str, access_level: str) -> str:
+    """
+    Override the access level classification of a tool.
+
+    Args:
+        tool_name: Tool name (e.g., "Bash", "mcp__email__send_email")
+        access_level: One of: "read", "write", "admin", "dangerous"
+    """
+    if access_level not in ('read', 'write', 'admin', 'dangerous'):
+        return json.dumps({"error": f"Invalid access_level '{access_level}'. Must be: read, write, admin, dangerous"})
+
+    conn = get_db()
+    now = utc_now_iso()
+    conn.execute("""
+        INSERT INTO tool_classifications (tool_name, access_level, auto_classified, updated_at)
+        VALUES (?, ?, 0, ?)
+        ON CONFLICT(tool_name) DO UPDATE SET access_level = excluded.access_level, auto_classified = 0, updated_at = excluded.updated_at
+    """, (tool_name, access_level, now))
+    conn.commit()
+    conn.close()
+    return json.dumps({"success": True, "tool_name": tool_name, "access_level": access_level})
+
+
+@mcp.tool()
+def get_tool_classifications(server_name: str = "") -> str:
+    """
+    List tool access level classifications.
+
+    Args:
+        server_name: Optional server name to filter (e.g., "email"). Empty for all tools.
+    """
+    conn = get_db()
+    if server_name:
+        rows = conn.execute(
+            "SELECT * FROM tool_classifications WHERE tool_name LIKE ? ORDER BY tool_name",
+            (f"mcp__{server_name}__%",)
+        ).fetchall()
+    else:
+        rows = conn.execute("SELECT * FROM tool_classifications ORDER BY tool_name").fetchall()
+    conn.close()
+    return json.dumps([{
+        "tool_name": r['tool_name'],
+        "access_level": r['access_level'],
+        "auto_classified": bool(r['auto_classified']),
+        "updated_at": r['updated_at'],
+    } for r in rows], indent=2)
+
+
 ADMIN_TOOLS = {
     "list_jobs": list_jobs,
     "create_job": create_job,
@@ -4423,6 +5339,16 @@ ADMIN_TOOLS = {
     "update_mcp_server": update_mcp_server,
     "delete_mcp_server": delete_mcp_server,
     "get_dynamic_mcp_server": get_dynamic_mcp_server,
+    # Workspace tools
+    "create_workspace": create_workspace,
+    "list_workspaces": list_workspaces,
+    "get_workspace": get_workspace,
+    "update_workspace": update_workspace,
+    "delete_workspace": delete_workspace,
+    "set_workspace_tools": set_workspace_tools,
+    "set_workspace_servers": set_workspace_servers,
+    "set_tool_access_level": set_tool_access_level,
+    "get_tool_classifications": get_tool_classifications,
 }
 
 def _unwrap_mcp_tool(func):
@@ -4528,6 +5454,95 @@ def create_run(job: dict) -> str:
     
     return run_id
 
+
+def _resolve_workspace_id(workspace_id: str) -> str | None:
+    """Resolve a workspace by ID or name (case-insensitive). Returns the workspace ID or None."""
+    if not workspace_id:
+        return None
+    conn = get_db()
+    # Try by ID first
+    ws = conn.execute("SELECT id FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if not ws:
+        # Try by name (case-insensitive)
+        ws = conn.execute("SELECT id FROM workspaces WHERE LOWER(name) = LOWER(?)", (workspace_id,)).fetchone()
+    conn.close()
+    return ws['id'] if ws else None
+
+
+def _get_default_workspace_id() -> str | None:
+    """Get the ID of the default workspace."""
+    conn = get_db()
+    ws = conn.execute("SELECT id FROM workspaces WHERE is_default = 1").fetchone()
+    conn.close()
+    return ws['id'] if ws else None
+
+
+def _get_run_workspace_id(run, job) -> str | None:
+    """Resolve workspace: run.workspace_id -> job.workspace_id -> default workspace."""
+    workspace_id = None
+    if run:
+        try:
+            workspace_id = run['workspace_id']
+        except (KeyError, IndexError):
+            pass
+    if not workspace_id and job:
+        try:
+            workspace_id = job['workspace_id']
+        except (KeyError, IndexError):
+            pass
+    if not workspace_id:
+        workspace_id = _get_default_workspace_id()
+    return workspace_id
+
+
+def _build_workspace_config(workspace_id: str) -> tuple[list[str], dict, str]:
+    """
+    Build execution config from a workspace.
+    Returns (allowed_tools, mcp_config, default_prompt).
+    Falls back to global settings if workspace not found.
+    """
+    conn = get_db()
+    ws = conn.execute("SELECT * FROM workspaces WHERE id = ?", (workspace_id,)).fetchone()
+    if not ws:
+        conn.close()
+        return None, None, ""
+
+    # Get enabled built-in tools (non-MCP tools)
+    tool_rows = conn.execute(
+        "SELECT tool_name FROM workspace_tools WHERE workspace_id = ? AND enabled = 1",
+        (workspace_id,)
+    ).fetchall()
+    allowed_tools = [r['tool_name'] for r in tool_rows if not r['tool_name'].startswith('mcp__')]
+    enabled_mcp_tools = {r['tool_name'] for r in tool_rows if r['tool_name'].startswith('mcp__')}
+
+    # Get enabled servers
+    server_rows = conn.execute(
+        "SELECT server_name FROM workspace_servers WHERE workspace_id = ? AND enabled = 1",
+        (workspace_id,)
+    ).fetchall()
+    enabled_servers = {r['server_name'] for r in server_rows}
+
+    # Load global MCP server configs and credentials
+    mcp_servers = []
+    mcp_env_vars = {}
+    for row in conn.execute("SELECT key, value FROM settings").fetchall():
+        try:
+            if row['key'] == 'mcp_servers':
+                mcp_servers = json.loads(row['value'])
+            elif row['key'] == 'mcp_env_vars':
+                mcp_env_vars = json.loads(row['value'])
+        except:
+            pass
+
+    conn.close()
+
+    # Filter MCP servers to only workspace-enabled ones
+    filtered_servers = [s for s in mcp_servers if s.get('name') in enabled_servers]
+
+    default_prompt = ws['default_prompt'] or ""
+    return allowed_tools, filtered_servers, default_prompt, enabled_mcp_tools, mcp_env_vars
+
+
 async def execute_run(run_id: str):
     """Execute a run using the configured provider (Claude, OpenAI, or Ollama)"""
     conn = get_db()
@@ -4560,25 +5575,50 @@ async def execute_run(run_id: str):
         cwd = str(Path(__file__).parent / "claude_playground")
         os.makedirs(cwd, exist_ok=True)
 
-        # Load settings from database
-        settings_conn = get_db()
-        allowed_tools = ["WebSearch", "WebFetch", "Read", "Write", "Edit", "Bash"]  # defaults
-        mcp_servers = []
-        mcp_env_vars = {}
-        sandbox_mode = True  # Default to sandboxed for safety
-        for row in settings_conn.execute("SELECT key, value FROM settings").fetchall():
-            try:
-                if row['key'] == 'allowed_tools':
-                    allowed_tools = json.loads(row['value'])
-                elif row['key'] == 'mcp_servers':
-                    mcp_servers = json.loads(row['value'])
-                elif row['key'] == 'mcp_env_vars':
-                    mcp_env_vars = json.loads(row['value'])
-                elif row['key'] == 'sandbox_mode':
-                    sandbox_mode = json.loads(row['value'])
-            except:
-                pass
-        settings_conn.close()
+        # Load workspace config or fall back to global settings
+        workspace_id = _get_run_workspace_id(run, job)
+        workspace_mcp_tools = set()  # enabled MCP tool names from workspace
+        use_workspace = False
+
+        if workspace_id:
+            ws_result = _build_workspace_config(workspace_id)
+            if ws_result and ws_result[0] is not None:
+                allowed_tools, mcp_servers_list, ws_default_prompt, workspace_mcp_tools, ws_env_vars = ws_result
+                mcp_servers = mcp_servers_list
+                mcp_env_vars = ws_env_vars
+                use_workspace = True
+            else:
+                allowed_tools = None  # signal to use global fallback
+
+        if not use_workspace:
+            # Legacy fallback: load from global settings
+            settings_conn = get_db()
+            allowed_tools = ["WebSearch", "WebFetch", "Read", "Write", "Edit", "Bash"]  # defaults
+            mcp_servers = []
+            mcp_env_vars = {}
+            for row in settings_conn.execute("SELECT key, value FROM settings").fetchall():
+                try:
+                    if row['key'] == 'allowed_tools':
+                        allowed_tools = json.loads(row['value'])
+                    elif row['key'] == 'mcp_servers':
+                        mcp_servers = json.loads(row['value'])
+                    elif row['key'] == 'mcp_env_vars':
+                        mcp_env_vars = json.loads(row['value'])
+                except:
+                    pass
+            settings_conn.close()
+            ws_default_prompt = ""
+
+        # Load sandbox mode from global settings (always global)
+        sandbox_mode = True
+        try:
+            sb_conn = get_db()
+            sb_row = sb_conn.execute("SELECT value FROM settings WHERE key = 'sandbox_mode'").fetchone()
+            if sb_row:
+                sandbox_mode = json.loads(sb_row['value'])
+            sb_conn.close()
+        except:
+            pass
 
         # Merge environment variables from .env (takes precedence over database)
         # Supports: MCP_VARNAME -> VARNAME, and input_varname -> input_varname
@@ -4713,6 +5753,10 @@ async def execute_run(run_id: str):
 
         # Build the prompt
         full_prompt = run['prompt']
+
+        # Prepend workspace default prompt if set
+        if use_workspace and ws_default_prompt:
+            full_prompt = ws_default_prompt + "\n\n" + full_prompt
 
         # Prepend sandbox notice if sandbox mode is enabled
         if sandbox_mode:
@@ -4941,6 +5985,7 @@ def main():
     init_db()
     cleanup_stale_runs()
     _auto_register_fixed_servers()
+    _classify_all_discovered_tools()
     init_providers()
     print(f"Database initialized at {DB_PATH}", file=sys.stderr)
 

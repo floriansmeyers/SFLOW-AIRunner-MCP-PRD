@@ -96,11 +96,15 @@ Jobs execute via a **provider abstraction layer**. The `command` field on jobs/r
 ## Database
 
 SQLite at `./jobs.db` with tables:
-- `jobs` - Scheduled tasks with cron expressions, prompts, timeout settings. The `command` field selects the AI provider (`"claude"`, `"openai"`, `"ollama"`)
-- `runs` - Execution history with output, tokens, cost, state (pending/running/finished/error)
-- `webhooks` - HTTP endpoints that trigger prompts with payload templating
+- `jobs` - Scheduled tasks with cron expressions, prompts, timeout settings. The `command` field selects the AI provider (`"claude"`, `"openai"`, `"ollama"`). Optional `workspace_id` for tool isolation.
+- `runs` - Execution history with output, tokens, cost, state (pending/running/finished/error). Optional `workspace_id`.
+- `webhooks` - HTTP endpoints that trigger prompts with payload templating. Optional `workspace_id`.
 - `settings` - Configuration for allowed tools, MCP servers, credentials, `default_provider`
 - `admin_chats` - Persisted admin chat conversations with full message history (Anthropic format JSON), title, provider, tool call count, timestamps
+- `workspaces` - Named tool configurations with description, default_prompt, is_default flag
+- `workspace_tools` - Per-workspace tool enablement (built-in + MCP tools). UNIQUE(workspace_id, tool_name)
+- `workspace_servers` - Per-workspace MCP server enablement. UNIQUE(workspace_id, server_name)
+- `tool_classifications` - Global tool access level classifications (read/write/admin/dangerous). Manual overrides persist (`auto_classified = 0`)
 
 ## MCP Tools
 
@@ -117,6 +121,8 @@ SQLite at `./jobs.db` with tables:
 **Credential Management:** `set_server_credential`, `get_server_credentials`, `list_required_credentials`, `get_unconfigured_servers`, `delete_server_credential`
 
 **Internal MCP:** `invoke_internal_mcp_tool`
+
+**Workspaces:** `create_workspace`, `list_workspaces`, `get_workspace`, `update_workspace`, `delete_workspace`, `set_workspace_tools`, `set_workspace_servers`, `set_tool_access_level`, `get_tool_classifications`
 
 ## URL Resolution
 
@@ -188,11 +194,44 @@ The Admin Chat enables system configuration through natural language, calling Sp
 ### Dashboard API Endpoints
 
 - `GET /api/providers` - Returns available providers with capabilities and default
-- `POST /api/run-prompt` - Accepts `{prompt, command}` where `command` is the provider name
+- `POST /api/run-prompt` - Accepts `{prompt, command, workspace_id}` where `command` is the provider name
 - `POST /api/admin-chat` - Admin chat with tool calling. Accepts `{messages, command, conversation_id}`, returns `{messages, response_text, tool_calls_made, conversation_id}`
 - `GET /api/admin-chats` - List admin chat conversations (metadata only, no messages). ORDER BY updated_at DESC LIMIT 100
 - `GET /api/admin-chat/{chat_id}` - Load a single conversation with full messages
 - `DELETE /api/admin-chat/{chat_id}` - Delete a conversation
+- `GET /api/workspaces` - List all workspaces with tool/server/job counts
+- `POST /api/workspace` - Create workspace `{name, description, default_prompt}`
+- `GET /api/workspace/{id}` - Get workspace details with tools and servers
+- `PUT /api/workspace/{id}` - Update workspace metadata, tools, and servers
+- `DELETE /api/workspace/{id}` - Delete workspace (prevents default, checks active jobs)
+- `GET /api/workspace/{id}/stats` - Cost/usage per workspace
+- `GET /api/tool-classifications` - All tool access level classifications
+- `PUT /api/tool-classification/{tool_name}` - Override tool classification
+- `GET /api/server/{name}/tools` - Discover tools for an MCP server with classifications
+
+### Workspace Architecture
+
+Workspaces provide **isolated tool configurations** for jobs and runs. Each workspace defines which built-in tools and MCP servers are available.
+
+**Execution pipeline** (`execute_run()` → `_get_run_workspace_id()` → `_build_workspace_config()`):
+1. Resolve workspace: `run.workspace_id` → `job.workspace_id` → default workspace
+2. Load enabled built-in tools from `workspace_tools`
+3. Load enabled MCP servers from `workspace_servers`
+4. Build `mcp_config` using only workspace-enabled servers (with global credentials)
+5. Prepend `workspace.default_prompt` to the run prompt
+6. Falls back to global settings if no workspace found (legacy compatibility)
+
+**Tool Access Levels** — auto-classified on startup, manual overrides persist:
+- `read` — query/view only (list_jobs, get_run, Read, WebSearch)
+- `write` — creates/modifies data (create_job, Write, send_email)
+- `admin` — system configuration (enable_server, set_credential)
+- `dangerous` — destructive/irreversible (delete_job, Bash, kill_run)
+
+**Dashboard Workspaces tab**: Grid of workspace cards → click to open detail modal with:
+- Metadata editing (name, description, default_prompt, is_default)
+- Built-in tool checkboxes with access level badges
+- MCP server toggles with expandable per-tool configuration
+- Bulk actions (enable all Read, disable all Dangerous)
 
 ## Key Dependencies
 

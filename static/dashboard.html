@@ -45,6 +45,9 @@
                 <select id="quick-provider" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-secondary); color: var(--text-primary); font-size: 14px; cursor: pointer; min-width: 110px;">
                     <option value="claude">Claude</option>
                 </select>
+                <select id="quick-workspace" style="padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-secondary); color: var(--text-primary); font-size: 14px; cursor: pointer; min-width: 130px;">
+                    <option value="">Default Workspace</option>
+                </select>
                 <input type="text" id="quick-prompt" class="quick-run-input" placeholder="Enter a prompt to run immediately..." onkeydown="if(event.key==='Enter')runQuickPrompt()">
                 <button class="quick-run-btn" id="quick-run-btn" onclick="runQuickPrompt()">Run Now</button>
             </div>
@@ -61,6 +64,7 @@
             <button class="tab" onclick="showTab('scheduled')">Scheduled</button>
             <button class="tab" onclick="showTab('webhooks')">Webhooks</button>
             <button class="tab" onclick="showTab('tool-logs')">Tool Logs</button>
+            <button class="tab" onclick="showTab('workspaces')">Workspaces</button>
             <button class="tab" onclick="showTab('settings')">Settings</button>
         </div>
 
@@ -124,7 +128,7 @@
                 <div class="table-wrapper">
                     <table>
                         <thead>
-                            <tr><th>ID</th><th>Name</th><th>Cron</th><th>Status</th><th>Last Run</th><th>Prompt</th><th>Actions</th></tr>
+                            <tr><th>ID</th><th>Name</th><th>Cron</th><th>Status</th><th>Workspace</th><th>Last Run</th><th>Prompt</th><th>Actions</th></tr>
                         </thead>
                         <tbody id="jobs-table"></tbody>
                     </table>
@@ -150,7 +154,7 @@
                 <div class="table-wrapper">
                     <table>
                         <thead>
-                            <tr><th>Name</th><th>URL</th><th>Provider</th><th>Triggers</th><th>Last Triggered</th><th>Status</th><th>Actions</th></tr>
+                            <tr><th>Name</th><th>URL</th><th>Provider</th><th>Workspace</th><th>Triggers</th><th>Last Triggered</th><th>Status</th><th>Actions</th></tr>
                         </thead>
                         <tbody id="webhooks-table"></tbody>
                     </table>
@@ -183,6 +187,60 @@
                         </thead>
                         <tbody id="tool-logs-table"></tbody>
                     </table>
+                </div>
+            </div>
+        </div>
+
+        <div id="workspaces" class="section">
+            <div class="card">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: var(--spacing-lg);">
+                    <div>
+                        <h2>Workspaces</h2>
+                        <p style="color: var(--text-secondary); margin-bottom: 0; font-size: 13px;">Isolated tool configurations for jobs and runs.</p>
+                    </div>
+                    <button class="quick-run-btn" onclick="showCreateWorkspaceModal()" style="padding: 8px 16px;">New Workspace</button>
+                </div>
+                <div class="mcp-cards-grid" id="workspaces-grid">
+                    <div class="mcp-loading">Loading workspaces...</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Workspace Detail Modal -->
+        <div id="workspace-modal" class="modal">
+            <div class="modal-content" style="max-width: 1000px;">
+                <div class="modal-header">
+                    <h3 id="workspace-modal-title">Workspace Details</h3>
+                    <button class="modal-close" onclick="closeWorkspaceModal()">&times;</button>
+                </div>
+                <div class="modal-body" id="workspace-modal-body" style="padding: var(--spacing-lg);">
+                </div>
+            </div>
+        </div>
+
+        <!-- Create Workspace Modal -->
+        <div id="create-workspace-modal" class="modal">
+            <div class="modal-content" style="max-width: 500px;">
+                <div class="modal-header">
+                    <h3>Create Workspace</h3>
+                    <button class="modal-close" onclick="closeCreateWorkspaceModal()">&times;</button>
+                </div>
+                <div class="modal-body" style="padding: var(--spacing-lg);">
+                    <div style="display: flex; flex-direction: column; gap: var(--spacing-md);">
+                        <div>
+                            <label style="font-weight: 500; display: block; margin-bottom: 4px;">Name</label>
+                            <input type="text" id="new-ws-name" style="width: 100%; padding: 8px 12px; border: 1px solid var(--border-default); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px;" placeholder="e.g., Read Only, Full Access">
+                        </div>
+                        <div>
+                            <label style="font-weight: 500; display: block; margin-bottom: 4px;">Description</label>
+                            <input type="text" id="new-ws-desc" style="width: 100%; padding: 8px 12px; border: 1px solid var(--border-default); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px;" placeholder="What is this workspace for?">
+                        </div>
+                        <div>
+                            <label style="font-weight: 500; display: block; margin-bottom: 4px;">Default Prompt (optional)</label>
+                            <textarea id="new-ws-prompt" style="width: 100%; padding: 8px 12px; border: 1px solid var(--border-default); background: var(--bg-tertiary); color: var(--text-primary); font-size: 14px; min-height: 80px; resize: vertical;" placeholder="Prepended to all runs in this workspace"></textarea>
+                        </div>
+                        <button class="quick-run-btn" onclick="createWorkspace()" style="align-self: flex-end; padding: 10px 24px;">Create</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -277,6 +335,7 @@
         let runsData = [];
         let webhooksData = [];
         let toolLogsData = [];
+        let workspacesData = [];
         let livePollingInterval = null;
         let currentRunId = null;
         let confirmCallback = null;
@@ -774,7 +833,7 @@
             if (webhooks.length === 0) {
                 const row = document.createElement('tr');
                 const cell = document.createElement('td');
-                cell.colSpan = 7;
+                cell.colSpan = 8;
                 cell.style.cssText = 'text-align: center; color: var(--text-muted); padding: var(--spacing-lg);';
                 cell.textContent = 'No webhooks configured. Create one using the MCP tool.';
                 row.appendChild(cell);
@@ -831,6 +890,20 @@
                 select.onchange = () => updateWebhookProvider(w.id, select.value);
                 providerCell.appendChild(select);
                 row.appendChild(providerCell);
+
+                // Workspace
+                const wsCell = document.createElement('td');
+                const wsName = w.workspace_id ? (workspacesData.find(ws => ws.id === w.workspace_id) || {}).name || w.workspace_id : '';
+                if (wsName) {
+                    const wsBadge = document.createElement('span');
+                    wsBadge.className = 'badge badge-workspace';
+                    wsBadge.textContent = wsName;
+                    wsCell.appendChild(wsBadge);
+                } else {
+                    wsCell.style.color = 'var(--text-muted)';
+                    wsCell.textContent = '—';
+                }
+                row.appendChild(wsCell);
 
                 // Triggers
                 const triggersCell = document.createElement('td');
@@ -1331,18 +1404,22 @@
 
             // Render scheduled jobs table
             document.getElementById('jobs-table').innerHTML = scheduledJobs.length === 0
-                ? '<tr><td colspan="7" style="text-align: center; color: var(--text-muted); padding: var(--spacing-lg);">No scheduled jobs. Create one using the MCP tool.</td></tr>'
-                : scheduledJobs.map(j => `
+                ? '<tr><td colspan="8" style="text-align: center; color: var(--text-muted); padding: var(--spacing-lg);">No scheduled jobs. Create one using the MCP tool.</td></tr>'
+                : scheduledJobs.map(j => {
+                    const jwsId = j.workspace_id || '';
+                    const jwsName = jwsId ? (workspacesData.find(w => w.id === jwsId) || {}).name || '' : '';
+                    return `
                 <tr>
                     <td><code style="color: var(--accent-cyan);">${j.id.substring(0, 8)}</code></td>
                     <td>${escapeHtml(j.name)}</td>
                     <td><span class="cron">${j.cron}</span></td>
                     <td><span class="status ${j.enabled ? 'enabled' : 'disabled'}">${j.enabled ? 'Enabled' : 'Disabled'}</span></td>
+                    <td><span class="status badge-workspace">${escapeHtml(jwsName || 'Default')}</span></td>
                     <td style="color: var(--text-secondary);">${j.last_executed_at ? new Date(j.last_executed_at).toLocaleString() : 'Never'}</td>
                     <td style="color: var(--text-secondary);">${escapeHtml(j.prompt.substring(0, 50))}${j.prompt.length > 50 ? '...' : ''}</td>
                     <td><button class="delete-btn" onclick="deleteJob('${j.id}', '${escapeHtml(j.name).replace(/'/g, "\\'")}')">Delete</button></td>
                 </tr>
-            `).join('');
+                `}).join('');
 
             // Separate runs by type
             const manualRuns = runsRes.filter(r => getRunType(r) === 'manual');
@@ -1359,6 +1436,9 @@
                     const cost = r.cost_usd || 0;
                     const isRunning = r.state === 'running' || r.state === 'pending';
                     const providerLabel = {claude: 'Claude', openai: 'OpenAI', ollama: 'Ollama'}[r.command] || r.command || 'Claude';
+                    const wsId = r.workspace_id || (job && job.workspace_id) || '';
+                    const wsName = wsId ? (workspacesData.find(w => w.id === wsId) || {}).name || wsId : '';
+                    const wsBadge = wsName ? '<span class="status badge-workspace">' + escapeHtml(wsName) + '</span>' : '';
                     return `
                     <div class="run-card run-card--manual" onclick="showRunDetails('${r.id}')">
                         <div class="run-card__prompt">
@@ -1367,6 +1447,7 @@
                         </div>
                         <div class="run-card__meta">
                             <span class="status badge-manual">Manual</span>
+                            ${wsBadge}
                             <span class="status" style="background: var(--bg-tertiary); color: var(--accent-cyan); font-size: 11px;">${escapeHtml(providerLabel)}${r.model ? ' · ' + escapeHtml(r.model) : ''}</span>
                             <span class="status ${r.state}">${isRunning ? '<span class="live-dot"></span>' : ''}${r.state}</span>
                             <span class="run-card__time">${timeAgo(r.started_at)}</span>
@@ -1557,6 +1638,7 @@
             const input = document.getElementById('quick-prompt');
             const btn = document.getElementById('quick-run-btn');
             const providerSelect = document.getElementById('quick-provider');
+            const workspaceSelect = document.getElementById('quick-workspace');
             const prompt = input.value.trim();
 
             if (!prompt) {
@@ -1569,10 +1651,13 @@
 
             try {
                 const command = providerSelect ? providerSelect.value : 'claude';
+                const workspace_id = workspaceSelect ? workspaceSelect.value : '';
+                const payload = { prompt, command };
+                if (workspace_id) payload.workspace_id = workspace_id;
                 const res = await fetch('/api/run-prompt', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ prompt, command })
+                    body: JSON.stringify(payload)
                 });
                 const data = await res.json();
 
@@ -1710,6 +1795,10 @@
                 '<span class="toggle-slider"></span>' +
                 '</label>' +
                 '<span style="font-size: 12px; color: var(--text-secondary);">' + (enabled ? 'Enabled' : 'Disabled') + '</span>' +
+                '</div>' +
+                '<div style="margin-top: 8px; border-top: 1px solid var(--border-default); padding-top: 8px;">' +
+                '<button onclick="toggleServerTools(\'' + escapeHtml(server.name) + '\', this)" style="font-size: 11px; padding: 4px 8px; background: var(--bg-tertiary); border: 1px solid var(--border-default); color: var(--accent-blue); cursor: pointer;">Show Tools</button>' +
+                '<div id="server-tools-' + escapeHtml(server.name) + '" style="display: none; margin-top: 8px;"></div>' +
                 '</div>' +
                 '</div>';
         }
@@ -1990,6 +2079,387 @@
         // Load settings on page load
         loadSettings();
 
+        // ========================================
+        // WORKSPACES
+        // ========================================
+        const ACCESS_LEVEL_COLORS = {
+            read: { bg: 'rgba(5, 150, 105, 0.15)', color: '#059669', label: 'Read' },
+            write: { bg: 'rgba(37, 99, 235, 0.15)', color: '#2563eb', label: 'Write' },
+            admin: { bg: 'rgba(217, 119, 6, 0.15)', color: '#d97706', label: 'Admin' },
+            dangerous: { bg: 'rgba(220, 38, 38, 0.15)', color: '#dc2626', label: 'Dangerous' }
+        };
+
+        function accessLevelBadge(level) {
+            const c = ACCESS_LEVEL_COLORS[level] || ACCESS_LEVEL_COLORS.read;
+            return '<span style="display:inline-block;padding:2px 6px;font-size:10px;font-weight:600;text-transform:uppercase;background:' + c.bg + ';color:' + c.color + ';border-left:2px solid ' + c.color + ';">' + c.label + '</span>';
+        }
+
+        async function loadWorkspaces() {
+            try {
+                const res = await fetch('/api/workspaces');
+                workspacesData = await res.json();
+                renderWorkspaces();
+                populateWorkspaceSelectors();
+            } catch (e) {
+                console.error('Failed to load workspaces:', e);
+            }
+        }
+
+        function populateWorkspaceSelectors() {
+            const selects = document.querySelectorAll('.workspace-select, #quick-workspace');
+            selects.forEach(select => {
+                const currentVal = select.value;
+                while (select.firstChild) select.removeChild(select.firstChild);
+                const defaultOpt = document.createElement('option');
+                defaultOpt.value = '';
+                defaultOpt.textContent = 'Default Workspace';
+                select.appendChild(defaultOpt);
+                workspacesData.forEach(ws => {
+                    const opt = document.createElement('option');
+                    opt.value = ws.id;
+                    opt.textContent = ws.name + (ws.is_default ? ' (Default)' : '');
+                    select.appendChild(opt);
+                });
+                select.value = currentVal;
+            });
+        }
+
+        function renderWorkspaces() {
+            const container = document.getElementById('workspaces-grid');
+            if (!workspacesData || workspacesData.length === 0) {
+                container.textContent = 'No workspaces configured.';
+                return;
+            }
+            container.innerHTML = workspacesData.map(ws => {
+                const defaultBadge = ws.is_default ? '<span style="display:inline-block;padding:2px 6px;font-size:10px;font-weight:600;background:rgba(37,99,235,0.15);color:#2563eb;margin-left:6px;">DEFAULT</span>' : '';
+                return '<div class="mcp-card ' + (ws.is_default ? 'enabled' : '') + '" style="cursor:pointer;" onclick="openWorkspaceDetail(\'' + ws.id + '\')">' +
+                    '<div class="mcp-card-header">' +
+                    '<div class="mcp-card-title">' + escapeHtml(ws.name) + defaultBadge + '</div>' +
+                    '</div>' +
+                    '<div class="mcp-card-desc">' + escapeHtml(ws.description || 'No description') + '</div>' +
+                    '<div style="display:flex;gap:12px;margin-top:8px;font-size:12px;color:var(--text-secondary);">' +
+                    '<span>' + ws.enabled_tools + ' tools</span>' +
+                    '<span>' + ws.enabled_servers + ' servers</span>' +
+                    '<span>' + (ws.job_count || 0) + ' jobs</span>' +
+                    '</div>' +
+                    '</div>';
+            }).join('');
+        }
+
+        function showCreateWorkspaceModal() {
+            document.getElementById('create-workspace-modal').classList.add('active');
+            document.getElementById('new-ws-name').focus();
+        }
+
+        function closeCreateWorkspaceModal() {
+            document.getElementById('create-workspace-modal').classList.remove('active');
+        }
+
+        async function createWorkspace() {
+            const name = document.getElementById('new-ws-name').value.trim();
+            const description = document.getElementById('new-ws-desc').value.trim();
+            const default_prompt = document.getElementById('new-ws-prompt').value.trim();
+            if (!name) {
+                showToast('Name is required', 'error');
+                return;
+            }
+            try {
+                const res = await fetch('/api/workspace', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, description, default_prompt })
+                });
+                const data = await res.json();
+                if (data.error) {
+                    showToast(data.error, 'error');
+                    return;
+                }
+                showToast('Workspace created', 'success');
+                closeCreateWorkspaceModal();
+                document.getElementById('new-ws-name').value = '';
+                document.getElementById('new-ws-desc').value = '';
+                document.getElementById('new-ws-prompt').value = '';
+                await loadWorkspaces();
+                openWorkspaceDetail(data.workspace_id);
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        function closeWorkspaceModal() {
+            document.getElementById('workspace-modal').classList.remove('active');
+        }
+
+        async function openWorkspaceDetail(workspaceId) {
+            try {
+                const [wsRes, classRes] = await Promise.all([
+                    fetch('/api/workspace/' + workspaceId),
+                    fetch('/api/tool-classifications')
+                ]);
+                const ws = await wsRes.json();
+                const allClassifications = await classRes.json();
+                if (ws.error) {
+                    showToast(ws.error, 'error');
+                    return;
+                }
+
+                const classMap = {};
+                allClassifications.forEach(c => { classMap[c.tool_name] = c.access_level; });
+
+                document.getElementById('workspace-modal-title').textContent = ws.name + (ws.is_default ? ' (Default)' : '');
+
+                // Build the detail view
+                const builtinTools = ['WebSearch', 'WebFetch', 'Read', 'Write', 'Edit', 'Bash'];
+                const enabledToolNames = new Set(ws.tools.filter(t => t.enabled).map(t => t.name));
+                const enabledServerNames = new Set(ws.servers.filter(s => s.enabled).map(s => s.name));
+
+                // Get available servers
+                let allServers = [];
+                try {
+                    const [fixedRes, dynRes] = await Promise.all([
+                        fetch('/api/fixed-servers'),
+                        fetch('/api/dynamic-servers')
+                    ]);
+                    const fixed = await fixedRes.json();
+                    const dyn = await dynRes.json();
+                    allServers = [...fixed.map(s => ({...s, type: 'fixed'})), ...dyn.map(s => ({...s, type: 'dynamic'}))];
+                } catch (e) { console.error(e); }
+
+                let html = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--spacing-lg);">';
+
+                // Left column: metadata
+                html += '<div>';
+                html += '<h4 style="margin-bottom:var(--spacing-sm);">Metadata</h4>';
+                html += '<div style="display:flex;flex-direction:column;gap:var(--spacing-sm);">';
+                html += '<div><label style="font-size:12px;font-weight:500;display:block;margin-bottom:2px;">Name</label>';
+                html += '<input type="text" id="ws-edit-name" value="' + escapeHtml(ws.name) + '" style="width:100%;padding:6px 10px;border:1px solid var(--border-default);background:var(--bg-tertiary);color:var(--text-primary);font-size:13px;"></div>';
+                html += '<div><label style="font-size:12px;font-weight:500;display:block;margin-bottom:2px;">Description</label>';
+                html += '<input type="text" id="ws-edit-desc" value="' + escapeHtml(ws.description) + '" style="width:100%;padding:6px 10px;border:1px solid var(--border-default);background:var(--bg-tertiary);color:var(--text-primary);font-size:13px;"></div>';
+                html += '<div><label style="font-size:12px;font-weight:500;display:block;margin-bottom:2px;">Default Prompt</label>';
+                html += '<textarea id="ws-edit-prompt" style="width:100%;padding:6px 10px;border:1px solid var(--border-default);background:var(--bg-tertiary);color:var(--text-primary);font-size:13px;min-height:60px;resize:vertical;">' + escapeHtml(ws.default_prompt) + '</textarea></div>';
+                html += '<div style="display:flex;align-items:center;gap:var(--spacing-sm);">';
+                html += '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;">';
+                html += '<input type="checkbox" id="ws-edit-default" ' + (ws.is_default ? 'checked' : '') + ' style="width:16px;height:16px;accent-color:var(--accent-blue);"> Set as default workspace</label></div>';
+                html += '<div style="display:flex;gap:var(--spacing-sm);margin-top:var(--spacing-sm);">';
+                html += '<button onclick="saveWorkspace(\'' + ws.id + '\')" style="padding:8px 16px;background:var(--accent-blue);color:white;border:none;cursor:pointer;font-size:13px;">Save</button>';
+                if (!ws.is_default) {
+                    html += '<button onclick="deleteWorkspace(\'' + ws.id + '\')" style="padding:8px 16px;background:var(--error);color:white;border:none;cursor:pointer;font-size:13px;">Delete</button>';
+                }
+                html += '</div></div></div>';
+
+                // Right column: tools and servers
+                html += '<div>';
+
+                // Built-in tools
+                html += '<h4 style="margin-bottom:var(--spacing-sm);">Built-in Tools</h4>';
+                html += '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-bottom:var(--spacing-md);">';
+                builtinTools.forEach(tool => {
+                    const enabled = enabledToolNames.has(tool);
+                    const level = classMap[tool] || 'read';
+                    html += '<label style="display:flex;align-items:center;gap:4px;padding:4px 8px;background:' + (enabled ? 'rgba(5,150,105,0.1)' : 'var(--bg-tertiary)') + ';border:1px solid ' + (enabled ? 'var(--success)' : 'var(--border-default)') + ';cursor:pointer;font-size:12px;">';
+                    html += '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="toggleWorkspaceTool(\'' + ws.id + '\',\'' + tool + '\',this.checked)" style="width:14px;height:14px;"> ';
+                    html += escapeHtml(tool) + ' ' + accessLevelBadge(level);
+                    html += '</label>';
+                });
+                html += '</div>';
+
+                // Bulk actions
+                html += '<div style="display:flex;gap:6px;margin-bottom:var(--spacing-md);">';
+                html += '<button onclick="bulkSetTools(\'' + ws.id + '\',\'read\',true)" style="font-size:11px;padding:3px 8px;background:rgba(5,150,105,0.15);color:#059669;border:1px solid #059669;cursor:pointer;">Enable Read</button>';
+                html += '<button onclick="bulkSetTools(\'' + ws.id + '\',\'dangerous\',false)" style="font-size:11px;padding:3px 8px;background:rgba(220,38,38,0.15);color:#dc2626;border:1px solid #dc2626;cursor:pointer;">Disable Dangerous</button>';
+                html += '</div>';
+
+                // MCP Servers
+                html += '<h4 style="margin-bottom:var(--spacing-sm);">MCP Servers</h4>';
+                if (allServers.length === 0) {
+                    html += '<div style="font-size:12px;color:var(--text-muted);">No servers available.</div>';
+                } else {
+                    allServers.forEach(server => {
+                        const sEnabled = enabledServerNames.has(server.name);
+                        html += '<div style="margin-bottom:8px;padding:8px;background:var(--bg-tertiary);border:1px solid ' + (sEnabled ? 'var(--success)' : 'var(--border-default)') + ';">';
+                        html += '<div style="display:flex;align-items:center;justify-content:space-between;">';
+                        html += '<label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:500;">';
+                        html += '<input type="checkbox" ' + (sEnabled ? 'checked' : '') + ' onchange="toggleWorkspaceServer(\'' + ws.id + '\',\'' + escapeHtml(server.name) + '\',this.checked)" style="width:16px;height:16px;"> ';
+                        html += escapeHtml(server.name) + '</label>';
+                        html += '<button onclick="loadWorkspaceServerTools(\'' + ws.id + '\',\'' + escapeHtml(server.name) + '\',this)" style="font-size:11px;padding:3px 8px;background:var(--bg-secondary);border:1px solid var(--border-default);color:var(--accent-blue);cursor:pointer;">Tools</button>';
+                        html += '</div>';
+                        html += '<div id="ws-server-tools-' + escapeHtml(server.name) + '" style="display:none;margin-top:6px;"></div>';
+                        html += '</div>';
+                    });
+                }
+
+                html += '</div></div>';
+
+                document.getElementById('workspace-modal-body').innerHTML = html;
+                document.getElementById('workspace-modal').classList.add('active');
+            } catch (e) {
+                showToast('Error loading workspace: ' + e.message, 'error');
+            }
+        }
+
+        async function saveWorkspace(workspaceId) {
+            const name = document.getElementById('ws-edit-name').value.trim();
+            const description = document.getElementById('ws-edit-desc').value.trim();
+            const default_prompt = document.getElementById('ws-edit-prompt').value;
+            const is_default = document.getElementById('ws-edit-default').checked;
+            try {
+                const res = await fetch('/api/workspace/' + workspaceId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name, description, default_prompt, is_default })
+                });
+                const data = await res.json();
+                if (data.error) {
+                    showToast(data.error, 'error');
+                    return;
+                }
+                showToast('Workspace saved', 'success');
+                await loadWorkspaces();
+                openWorkspaceDetail(workspaceId);
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function deleteWorkspace(workspaceId) {
+            showConfirm('Delete Workspace', 'Are you sure you want to delete this workspace?', async () => {
+                try {
+                    const res = await fetch('/api/workspace/' + workspaceId, { method: 'DELETE' });
+                    const data = await res.json();
+                    if (data.error) {
+                        showToast(data.error, 'error');
+                        return;
+                    }
+                    showToast('Workspace deleted', 'success');
+                    closeWorkspaceModal();
+                    await loadWorkspaces();
+                } catch (e) {
+                    showToast('Error: ' + e.message, 'error');
+                }
+            });
+        }
+
+        async function toggleWorkspaceTool(workspaceId, toolName, enabled) {
+            try {
+                await fetch('/api/workspace/' + workspaceId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tools: [{ name: toolName, enabled }] })
+                });
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function toggleWorkspaceServer(workspaceId, serverName, enabled) {
+            try {
+                await fetch('/api/workspace/' + workspaceId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ servers: [{ name: serverName, enabled }] })
+                });
+                await loadWorkspaces();
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function loadWorkspaceServerTools(workspaceId, serverName, btn) {
+            const container = document.getElementById('ws-server-tools-' + serverName);
+            if (!container) return;
+            if (container.style.display !== 'none') {
+                container.style.display = 'none';
+                btn.textContent = 'Tools';
+                return;
+            }
+            container.textContent = 'Loading...';
+            container.style.display = 'block';
+            btn.textContent = 'Hide';
+            try {
+                const [toolsRes, wsRes] = await Promise.all([
+                    fetch('/api/server/' + serverName + '/tools'),
+                    fetch('/api/workspace/' + workspaceId)
+                ]);
+                const toolsData = await toolsRes.json();
+                const wsData = await wsRes.json();
+                const enabledTools = new Set(wsData.tools.filter(t => t.enabled).map(t => t.name));
+
+                if (!toolsData.tools || toolsData.tools.length === 0) {
+                    container.textContent = 'No tools discovered.';
+                    return;
+                }
+
+                container.innerHTML = '<div style="display:flex;flex-direction:column;gap:4px;">' +
+                    toolsData.tools.map(t => {
+                        const enabled = enabledTools.has(t.qualified_name);
+                        return '<label style="display:flex;align-items:center;gap:6px;font-size:11px;padding:2px 0;cursor:pointer;">' +
+                            '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="toggleWorkspaceTool(\'' + workspaceId + '\',\'' + escapeHtml(t.qualified_name) + '\',this.checked)" style="width:13px;height:13px;"> ' +
+                            '<span>' + escapeHtml(t.name) + '</span> ' +
+                            accessLevelBadge(t.access_level) +
+                            (t.description ? '<span style="color:var(--text-muted);margin-left:4px;">' + escapeHtml(t.description.substring(0, 60)) + '</span>' : '') +
+                            '</label>';
+                    }).join('') +
+                    '</div>';
+            } catch (e) {
+                container.textContent = 'Error loading tools.';
+            }
+        }
+
+        async function bulkSetTools(workspaceId, accessLevel, enabled) {
+            try {
+                const classRes = await fetch('/api/tool-classifications');
+                const classifications = await classRes.json();
+                const matching = classifications.filter(c => c.access_level === accessLevel);
+                if (matching.length === 0) {
+                    showToast('No tools with access level: ' + accessLevel, 'info');
+                    return;
+                }
+                const tools = matching.map(c => ({ name: c.tool_name, enabled }));
+                await fetch('/api/workspace/' + workspaceId, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tools })
+                });
+                showToast((enabled ? 'Enabled' : 'Disabled') + ' ' + tools.length + ' ' + accessLevel + ' tools', 'success');
+                await loadWorkspaces();
+                openWorkspaceDetail(workspaceId);
+            } catch (e) {
+                showToast('Error: ' + e.message, 'error');
+            }
+        }
+
+        async function toggleServerTools(serverName, btn) {
+            const container = document.getElementById('server-tools-' + serverName);
+            if (!container) return;
+            if (container.style.display !== 'none') {
+                container.style.display = 'none';
+                btn.textContent = 'Show Tools';
+                return;
+            }
+            container.textContent = 'Loading...';
+            container.style.display = 'block';
+            btn.textContent = 'Hide Tools';
+            try {
+                const res = await fetch('/api/server/' + serverName + '/tools');
+                const data = await res.json();
+                if (!data.tools || data.tools.length === 0) {
+                    container.textContent = 'No tools discovered.';
+                    return;
+                }
+                container.innerHTML = '<div style="display:flex;flex-direction:column;gap:3px;">' +
+                    data.tools.map(t =>
+                        '<div style="display:flex;align-items:center;gap:6px;font-size:11px;padding:2px 0;">' +
+                        '<span style="font-weight:500;">' + escapeHtml(t.name) + '</span> ' +
+                        accessLevelBadge(t.access_level) +
+                        (t.description ? '<span style="color:var(--text-muted);">' + escapeHtml(t.description.substring(0, 80)) + '</span>' : '') +
+                        '</div>'
+                    ).join('') +
+                    '</div>';
+            } catch (e) {
+                container.textContent = 'Error loading tools.';
+            }
+        }
+
         // Load available providers and populate dropdowns
         async function loadProviders() {
             try {
@@ -2015,6 +2485,7 @@
             }
         }
         loadProviders();
+        loadWorkspaces();
 
         // Check ngrok status once on load
         updateNgrokStatus();

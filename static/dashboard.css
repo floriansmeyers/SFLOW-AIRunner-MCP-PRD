@@ -144,6 +144,7 @@ gap: 6px;
 .badge-manual { background: rgba(245, 158, 11, 0.15); color: var(--manual-color); border-left: 3px solid var(--manual-color); }
 .badge-scheduled { background: rgba(59, 130, 246, 0.15); color: var(--scheduled-color); border-left: 3px solid var(--scheduled-color); }
 .badge-webhook { background: rgba(139, 92, 246, 0.15); color: var(--webhook-color); border-left: 3px solid var(--webhook-color); }
+.badge-workspace { background: rgba(79, 70, 229, 0.12); color: var(--info); border-left: 3px solid var(--info); font-size: 10px; }
 
 /* ========================================
    BUTTONS - Sharp, Uppercase
